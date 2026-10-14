@@ -1,0 +1,51 @@
+tile_num,realm,band,lon,lat,ncol,reason,opera_granules_2020
+1513,Eurasia,<55,81.79,44.91,3000,stratified: Eurasia <55,1215
+2548,Eurasia,<55,101.55,48.96,3000,stratified: Eurasia <55,833
+4395,Eurasia,<55,140.42,49.03,3000,stratified: Eurasia <55,1275
+2471,Eurasia,<55,100.89,50.02,3000,stratified: Eurasia <55,612
+669,Eurasia,<55,62.42,50.2,3000,stratified: Eurasia <55,491
+3408,Eurasia,<55,118.16,51.21,3000,stratified: Eurasia <55,680
+4403,Eurasia,<55,155.45,53.87,3000,stratified: Eurasia <55,676
+2556,Eurasia,<55,105.99,54.81,3000,stratified: Eurasia <55,744
+1011,Eurasia,<55,70.92,54.86,3000,stratified: Eurasia <55,740
+26841,Eurasia,<55,19.61,54.96,3000,stratified: Eurasia <55,4472
+25516,Eurasia,55-60,-6.36,55.6,3000,stratified: Eurasia 55-60,4904
+26844,Eurasia,55-60,16.36,56.56,3000,stratified: Eurasia 55-60,4367
+3701,Eurasia,55-60,134.89,57.59,3000,stratified: Eurasia 55-60,713
+281,Eurasia,55-60,41.53,58.0,3000,stratified: Eurasia 55-60,443
+771,Eurasia,55-60,62.42,59.16,3000,stratified: Eurasia 55-60,360
+2722,Eurasia,60-65,115.65,60.15,3000,stratified: Eurasia 60-65,575
+1761,Eurasia,60-65,92.39,60.97,3000,stratified: Eurasia 60-65,345
+147,Eurasia,60-65,22.83,62.31,3000,stratified: Eurasia 60-65,3985
+3618,Eurasia,60-65,149.4,62.98,3000,stratified: Eurasia 60-65,1484
+2571,Eurasia,60-65,119.15,64.94,3000,stratified: Eurasia 60-65,595
+3634,Eurasia,65-70,179.09,66.0,2716,"antimeridian split, 2716 cols",381
+363400,Eurasia,65-70,-179.9,66.01,284,"antimeridian split, 284 cols",0
+605,Eurasia,65-70,50.87,66.03,3000,stratified: Eurasia 65-70,576
+380,Eurasia,65-70,37.37,66.1,3000,stratified: Eurasia 65-70,2197
+780,Eurasia,65-70,59.18,66.18,3000,stratified: Eurasia 65-70,608
+3348,Eurasia,65-70,159.9,67.27,3000,stratified: Eurasia 65-70,1093
+2345,Eurasia,70+,122.33,70.17,3000,stratified: Eurasia 70+,703
+36852,Eurasia,70+,96.15,76.64,3000,stratified: Eurasia 70+,834
+37080,Eurasia,70+,101.77,77.95,3000,northernmost tile,591
+36245,N America,<55,-78.1,40.83,3000,stratified: N America <55,565
+1941,N America,<55,-88.13,43.17,3000,stratified: N America <55,468
+1869,N America,<55,-87.27,44.14,3000,stratified: N America <55,651
+848,N America,<55,-66.92,46.38,3000,stratified: N America <55,1432
+1559,N America,<55,-82.15,47.2,3000,stratified: N America <55,776
+389,N America,<55,-52.09,49.98,3000,stratified: N America <55,2471
+983,N America,<55,-69.63,53.86,3000,stratified: N America <55,750
+4342,N America,55-60,-158.25,56.14,3000,stratified: N America 55-60,879
+4305,N America,55-60,-157.77,56.9,3000,stratified: N America 55-60,982
+1318,N America,55-60,-78.31,57.9,3000,stratified: N America 55-60,467
+3283,N America,60-65,-129.47,60.51,3000,stratified: N America 60-65,1500
+3928,N America,60-65,-151.33,60.75,3000,Kenai (G-LiHT 2014/2018),1092
+3919,N America,60-65,-166.21,62.99,3000,stratified: N America 60-65,1440
+3552,N America,60-65,-149.93,63.97,3000,stratified: N America 60-65,1337
+3732,N America,60-65,-165.44,64.55,3000,Seward Peninsula (field transects),1448
+3638,N America,65-70,-165.02,65.33,3000,Seward Peninsula (field transects),1541
+3364,N America,65-70,-148.24,65.4,3000,README example (interior AK),1339
+2913,N America,65-70,-137.66,67.55,3000,stratified: N America 65-70,1999
+39261,N America,65-70,-117.33,69.3,3000,stratified: N America 65-70,1117
+39464,N America,70+,-122.04,70.06,3000,stratified: N America 70+,1316
+40664,N America,70+,-145.95,70.4,3000,stratified: N America 70+,2381
