@@ -1,7 +1,4 @@
-# Template for the registration interface in the supplied MAAP DPS tutorial.
-# Copy this package's CONTENTS to your future public repository root.
-# Repository and current branch are configured; registration uses remote code.
-algorithm_name: sar-s1-seasonal-rtc
+algorithm_name: s1-seasonal-rtc
 algorithm_description: >-
   Three seasonal Sentinel-1 OPERA RTC VV/VH means and valid-pass counts for
   one bounding box and year. Mask and reproject native bursts, composite
@@ -17,11 +14,6 @@ queue: maap-dps-worker-16gb
 disk_space: 20GB
 inputs:
   config: []
-  file:
-    - name: template
-      description: Optional reference raster URL; DPS stages it in input/ to define the exact output grid.
-      default: ''
-      required: false
   positional:
     - name: bbox
       description: WGS84 west,south,east,north, as one comma-separated string; no dateline crossing.
