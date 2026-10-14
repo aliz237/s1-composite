@@ -42,6 +42,7 @@ def write_stac(cog_path, manifest_path):
         name: {"start": s["start"], "end_exclusive": s["end_exclusive"],
                "source_ids": sorted(r["id"] for r in s["records"])} for name, s in windows.items()
     }
+    identities["bbox_crs"] = meta.get("bbox_crs", "EPSG:4326")
     signature = hashlib.sha256(json.dumps(identities, sort_keys=True, separators=(",", ":"),
                                          allow_nan=False).encode()).hexdigest()[:16]
     item_id = f"{cog.stem}-{signature}"
@@ -52,6 +53,7 @@ def write_stac(cog_path, manifest_path):
         "s1-composite:source_collection": "OPERA_L2_RTC-S1_V1",
         "s1-composite:polarizations": ["VV", "VH"],
         "s1-composite:requested_bbox": meta["bbox"],
+        "s1-composite:requested_bbox_crs": meta.get("bbox_crs", "EPSG:4326"),
         "s1-composite:resampling": meta["resampling"],
         "s1-composite:mask_values_kept": meta["mask_values_kept"],
         "s1-composite:temporal_weighting": meta["temporal_weighting"],

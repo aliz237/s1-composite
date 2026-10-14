@@ -2,8 +2,8 @@
 set -euo pipefail
 
 _s1_package_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-if (( $# < 3 || $# > 9 )); then
-  echo 'Usage: run.sh BBOX YEAR IDENTIFIER [CRS_OR_EMPTY_WITH_TEMPLATE] [SPACING] [RESAMPLING] [SPECKLE_FILTER] [SEASON_WINDOWS_JSON] [WRITE_STAC]' >&2
+if (( $# < 3 || $# > 10 )); then
+  echo 'Usage: run.sh BBOX YEAR IDENTIFIER [CRS_OR_EMPTY_WITH_TEMPLATE] [SPACING] [RESAMPLING] [SPECKLE_FILTER] [SEASON_WINDOWS_JSON] [WRITE_STAC] [BBOX_CRS]' >&2
   exit 2
 fi
 
@@ -19,6 +19,7 @@ export PYTHONUNBUFFERED=1
 exec conda run --no-capture-output --name sar_s1_dps \
   python "${_s1_package_dir}/main.py" \
   --bbox="$1" \
+  --bbox-crs="${10:-EPSG:4326}" \
   --year="$2" \
   --identifier="$3" \
   --crs="${4:-}" \

@@ -101,7 +101,7 @@ The ordered positional fields are:
 
 | Position | Field | Default / meaning |
 | --- | --- | --- |
-| 1 | `bbox` | Required **string**: WGS84 west,south,east,north |
+| 1 | `bbox` | Required **string**: xmin,ymin,xmax,ymax in `bbox_crs` |
 | 2 | `year` | Required acquisition year; suggested 2020 |
 | 3 | `tile_identifier` | Required filename identifier: letters/digits/underscore/hyphen |
 | 4 | `crs` | Empty; **required without template**, e.g. `@custom_albers.wkt` |
@@ -110,12 +110,15 @@ The ordered positional fields are:
 | 7 | `speckle_filter` | `true`; final seasonal mean filtering |
 | 8 | `season_windows` | `{}` for the standard three seasons |
 | 9 | `write_stac` | `true`; set `false` to skip STAC generation/validation |
+| 10 | `bbox_crs` | `EPSG:4326`; set `@custom_albers.wkt` for Albers bounds |
 
-`template` is an optional **File** input, separate from positional arguments.
-Supply a downloadable URL, not a local ADE path. DPS stages it in `input/`.
-Exactly one staged file is supported. A template copies its full projection,
-transform, dimensions and extent; bbox masks that grid. Leave CRS blank when
-using a template, or pass CRS explicitly for a grid derived from bbox/spacing.
+The Python CLI also accepts a local `--template` or one staged file in `input/`.
+A template copies its full projection, transform, dimensions and extent; bbox
+masks that grid. The current registration does not declare a DPS File input.
+To stage a template through `submitJob`, first add an optional `template` File
+input to the registration. Projected bounds matching the output CRS need no
+template: their exact upper-left origin is preserved, without snapping to a
+zero-based grid. Their width and height must span whole pixels at `spacing`.
 
 `bbox` is passed as a single string in the DPS request and shell runner. It is
 parsed into numbers inside the compositor for geometry calculations, then
@@ -123,22 +126,35 @@ formatted as a CMR string. Do not submit a Python tuple as the DPS parameter.
 
 ```python
 job = maap.submitJob(
-    identifier="s1-2020-alaska001",   # DPS job tag
-    algo_id="sar-s1-seasonal-rtc",
+    identifier="s1-2020-3364",        # DPS job tag
+    algo_id="s1-seasonal-rtc",
     version="main",
     queue="maap-dps-worker-16gb",
-    bbox="-147.81927653,64.48911791,-145.1944614,65.56965877",
+    bbox="1358522,3123304,1448522,3213304",
+    bbox_crs="@custom_albers.wkt",   # Bounds are in Albers metres.
     year="2020",
-    tile_identifier="alaska001",     # COG filename identifier
+    tile_identifier="3364",          # COG filename identifier
     crs="@custom_albers.wkt",        # Explicit custom projection
     spacing="30",
     resampling="nearest",
     speckle_filter="true",
     season_windows="{}",
     write_stac="false",             # Use "true" to emit item + catalog
-    # template="https://.../grid.tif",  # If supplied, its grid takes precedence
 )
 ```
+
+This produces a 3000 × 3000 grid at 30 m for the supplied tile bounds. For exact
+alignment with another raster, obtain coordinates from `src.bounds`, CRS from
+`src.crs`, and spacing from `src.res`; retain coordinate precision. This assumes
+a north-up square-pixel raster; use a template for a rotated/sheared grid.
+Only the search envelope is converted to EPSG:4326. The output and its mask
+come from the original bbox in `bbox_crs`, not from that geographic envelope.
+Longitude/latitude calls continue to work with `bbox_crs="EPSG:4326"` (default).
+If input/output CRSs differ, a bounding rectangle is reprojected and enclosed;
+it does not recover an original raster grid from its geographic envelope.
+
+Publish and re-register the changed code/configuration before using the new
+`bbox_crs` DPS argument; an already registered build does not update itself.
 
 The `tile_identifier` field avoids a naming conflict with the SDK's
 `submitJob(identifier=...)` job-tag parameter. Identifiers produce

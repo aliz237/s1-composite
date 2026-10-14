@@ -6,15 +6,15 @@ from pathlib import Path
 import sys
 
 from opera_seasonal_mean import (_output_name, _season_dates, parse_bbox as bbox_coords,
-                                 resolve_crs, seasonal_composites)
+                                 resolve_bbox_crs, resolve_crs, seasonal_composites)
 
 
 def parse_bbox(value):
     try:
-        bbox_coords(value)
+        bbox_coords(value, bbox_crs=None)  # CRS-dependent validation follows argument parsing.
         return value  # Preserve the single DPS string; the compositor parses it.
     except ValueError:
-        raise argparse.ArgumentTypeError("bbox must be west,south,east,north in WGS84, without dateline crossing") from None
+        raise argparse.ArgumentTypeError("bbox must be finite xmin,ymin,xmax,ymax in increasing order") from None
 
 
 def parse_bool(value):
@@ -38,6 +38,8 @@ def parse_windows(value):
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--bbox", required=True, type=parse_bbox)
+    p.add_argument("--bbox-crs", default="EPSG:4326",
+                   help="CRS of bbox coordinates; EPSG/PROJ/WKT or @path/to/crs.wkt")
     p.add_argument("--year", required=True, type=int)
     p.add_argument("--identifier", required=True)
     p.add_argument("--crs", default=None,
@@ -68,20 +70,25 @@ def staged_template(args):
     return files[0] if files else None
 
 
+def _job_crs_value(value):
+    if value and value.startswith("@"):
+        path = Path(value[1:])
+        if not path.is_absolute() and not path.exists():
+            path = Path(__file__).resolve().parent / path
+        return path
+    return value
+
+
 def run_job(args, maap=None):
     # Validate identities/windows before authenticating or starting expensive work.
     _output_name(args.year, args.identifier)
     _season_dates(args.year, args.season_windows)
+    bbox_crs = resolve_bbox_crs(_job_crs_value(args.bbox_crs))
+    bbox_coords(args.bbox, bbox_crs)
     template = staged_template(args)
     crs = None
     if template is None:
-        value = args.crs
-        if value and value.startswith("@"):
-            path = Path(value[1:])
-            if not path.is_absolute() and not path.exists():
-                path = Path(__file__).resolve().parent / path
-            value = path
-        crs = resolve_crs(value)
+        crs = resolve_crs(_job_crs_value(args.crs))
     if args.max_results < 1 or args.max_pixels < 1 or args.spacing <= 0:
         raise ValueError("Search/grid limits and spacing must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -91,7 +98,7 @@ def run_job(args, maap=None):
         from maap.maap import MAAP
         maap = MAAP()  # DPS supplies MAAP authentication; no user credentials in args.
     outputs = seasonal_composites(
-        maap, bbox=args.bbox, year=args.year, identifier=args.identifier,
+        maap, bbox=args.bbox, bbox_crs=bbox_crs, year=args.year, identifier=args.identifier,
         outdir=args.output_dir, crs=crs, spacing=args.spacing,
         template=template, resampling=args.resampling,
         speckle_filter=args.speckle_filter,

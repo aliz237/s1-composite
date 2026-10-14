@@ -28,30 +28,84 @@ DEFAULT_WINDOWS = {
 }
 
 
-def parse_bbox(value):
+def parse_bbox(value, bbox_crs="EPSG:4326"):
     """Accept a DPS comma-separated string or a four-coordinate sequence."""
     try:
         coords = value.split(",") if isinstance(value, str) else value
         west, south, east, north = (float(x) for x in coords)
     except (ValueError, TypeError):
-        raise ValueError("bbox must be west,south,east,north (four WGS84 coordinates)") from None
-    if not (-180 <= west < east <= 180 and -90 <= south < north <= 90):
+        raise ValueError("bbox must be xmin,ymin,xmax,ymax (four coordinates)") from None
+    if not all(math.isfinite(x) for x in (west, south, east, north)) or west >= east or south >= north:
+        raise ValueError("Use finite ordered bbox coordinates: xmin < xmax and ymin < ymax")
+    if bbox_crs is not None and resolve_bbox_crs(bbox_crs).is_geographic and not (
+            -180 <= west < east <= 180 and -90 <= south < north <= 90):
         raise ValueError("Use finite WGS84 bounds without dateline crossing")
     return west, south, east, north
 
 
-def resolve_crs(value):
-    """Explicit EPSG/PROJ/WKT, a pathlib.Path, or @path/to/crs.wkt; no fallback."""
+def resolve_bbox_crs(value):
+    """Read an explicit input CRS, including @WKT files."""
     from rasterio.crs import CRS
     if value is None or isinstance(value, str) and not value.strip():
-        raise ValueError("Provide an explicit crs or a reference template raster")
+        raise ValueError("Provide an explicit CRS")
     if isinstance(value, Path) or isinstance(value, str) and value.startswith("@"):
         path = value if isinstance(value, Path) else Path(value[1:])
         value = path.read_text().strip()
-    crs = CRS.from_user_input(value)
+    return CRS.from_user_input(value)
+
+
+def resolve_crs(value):
+    """Explicit projected metre CRS for the output; no fallback."""
+    if value is None or isinstance(value, str) and not value.strip():
+        raise ValueError("Provide an explicit crs or a reference template raster")
+    crs = resolve_bbox_crs(value)
     if not crs.is_projected or crs.linear_units != "metre":
         raise ValueError("Use an explicit projected CRS with metre units")
     return crs
+
+
+def _bbox_geometry(bbox):
+    # Densify in the INPUT CRS so reprojection preserves curved boundaries.
+    west, south, east, north = bbox
+    corners = [(west, south), (east, south), (east, north), (west, north)]
+    ring = []
+    for a, b in zip(corners, corners[1:] + corners[:1]):
+        ring.extend([(a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+                     for t in np.linspace(0, 1, 101, endpoint=False)])
+    ring.append(ring[0])
+    return {"type": "Polygon", "coordinates": [ring]}
+
+
+def _search_bbox(geometry, bbox_crs):
+    from rasterio.warp import transform_geom
+    geographic = transform_geom(bbox_crs, "EPSG:4326", geometry)
+    xs, ys = zip(*geographic["coordinates"][0])
+    if any(abs(b - a) > 180 for a, b in zip(xs, xs[1:])):
+        raise ValueError("Bounding box crosses the dateline after projection; split the tile")
+    return parse_bbox((min(xs), min(ys), max(xs), max(ys)))
+
+
+def _grid_from_bbox(bbox, bbox_crs, crs, spacing):
+    """Preserve native bounds/origin; enclose reprojected bounds otherwise."""
+    from rasterio.transform import from_origin
+    from rasterio.warp import transform_geom
+    if not math.isfinite(spacing) or spacing <= 0:
+        raise ValueError("spacing must be finite and positive")
+    if bbox_crs == crs:
+        left, bottom, right, top = bbox
+        dimensions = ((right - left) / spacing, (top - bottom) / spacing)
+        if any(not math.isclose(v, round(v), rel_tol=0, abs_tol=1e-7) or round(v) < 1
+               for v in dimensions):
+            raise ValueError("Bounds in the output CRS must span a whole number of pixels at spacing")
+        width, height = map(round, dimensions)
+    else:
+        geom = transform_geom(bbox_crs, crs, _bbox_geometry(bbox))
+        xs, ys = zip(*geom["coordinates"][0])
+        left = math.floor(min(xs) / spacing) * spacing
+        top = math.ceil(max(ys) / spacing) * spacing
+        width = math.ceil((max(xs) - left) / spacing)
+        height = math.ceil((top - min(ys)) / spacing)
+    return from_origin(left, top, spacing, spacing), width, height
 
 
 def _write_stac_outputs(cog, manifest):
@@ -220,7 +274,8 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                         resampling="nearest", speckle_filter=True,
                         season_windows=None, crs=None, spacing=30,
                         template=None, max_results=20000, max_pixels=25000000,
-                        filter_tile_size=512, overwrite=False, write_stac=False):
+                        filter_tile_size=512, overwrite=False, write_stac=False,
+                        bbox_crs="EPSG:4326"):
     """Write three seasonal means/counts to one SAR_S1_year_identifier COG.
 
     Default windows include Jan 1–Mar 31, Jun 15–Aug 31, Sep 15–Oct 31 of
@@ -229,7 +284,9 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
     All 12 bands are Float32; counts are integer-valued, with 0 meaning no
     valid passes. Means are linear gamma-zero power; missing output means are
     -9999. Counts are 0 for no observations inside bbox; outside bbox is -9999.
-    bbox accepts a comma-separated string (DPS) or a coordinate sequence.
+    bbox accepts xmin,ymin,xmax,ymax as a string (DPS) or coordinate sequence,
+    in bbox_crs (default EPSG:4326). Matching input/output CRS preserves the
+    supplied bounds and origin; extents must span whole pixels at spacing.
     Optional template uses its full grid with the bbox mask. Run per tile.
     write_stac=True adds an item and catalog; requires the optional STAC helper
     and dependencies. Default False writes only the COG and source manifest.
@@ -240,12 +297,12 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
     from rasterio.features import geometry_mask
     from rasterio.session import AWSSession
     from rasterio.shutil import copy as rio_copy
-    from rasterio.transform import from_origin
     from rasterio.warp import transform_geom
 
     dates = _season_dates(year, season_windows)
     filename = _output_name(year, identifier)
-    bbox = parse_bbox(bbox)
+    bbox_crs = resolve_bbox_crs(bbox_crs)
+    bbox = parse_bbox(bbox, bbox_crs)
     if not template:
         crs = resolve_crs(crs)
     allowed = {"nearest": Resampling.nearest, "bilinear": Resampling.bilinear,
@@ -267,35 +324,20 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
     manifest = folder / (final.stem + "_manifest.json")
     if not overwrite and (final.exists() or manifest.exists()):
         raise FileExistsError(f"Output exists: {final} or {manifest}; use overwrite=True to replace")
-    west, south, east, north = map(float, bbox)
-    if not (-180 <= west < east <= 180 and -90 <= south < north <= 90):
-        raise ValueError("Use a non-dateline-crossing west,south,east,north box.")
-    if spacing <= 0:
-        raise ValueError("spacing must be positive.")
-
-    # Densify the geographic box before projecting its curved boundaries.
-    ring = []
-    corners = [(west, south), (east, south), (east, north), (west, north)]
-    for a, b in zip(corners, corners[1:] + corners[:1]):
-        ring.extend([(a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
-                     for t in np.linspace(0, 1, 101, endpoint=False)])
-    ring.append(ring[0])
+    if not math.isfinite(spacing) or spacing <= 0:
+        raise ValueError("spacing must be finite and positive.")
+    geometry = _bbox_geometry(bbox)
+    search_bbox = _search_bbox(geometry, bbox_crs)
     if template:
         with rasterio.open(template) as ref:
             crs, affine, width, height = ref.crs, ref.transform, ref.width, ref.height
         if crs is None:
             raise ValueError("Template must have a CRS")
     else:
-        geom = transform_geom("EPSG:4326", crs, {"type": "Polygon", "coordinates": [ring]})
-        xs, ys = zip(*geom["coordinates"][0])
-        left = math.floor(min(xs) / spacing) * spacing
-        top = math.ceil(max(ys) / spacing) * spacing
-        width = math.ceil((max(xs) - left) / spacing)
-        height = math.ceil((top - min(ys)) / spacing)
-        affine = from_origin(left, top, spacing, spacing)
+        affine, width, height = _grid_from_bbox(bbox, bbox_crs, crs, spacing)
     if width * height > max_pixels:
         raise ValueError("Grid exceeds max_pixels; process smaller tiles.")
-    geom = transform_geom("EPSG:4326", crs, {"type": "Polygon", "coordinates": [ring]})
+    geom = transform_geom(bbox_crs, crs, geometry)
     inside = geometry_mask([geom], (height, width), affine, invert=True)
     if not np.any(inside):
         raise ValueError("Bounding box does not intersect the template grid.")
@@ -319,6 +361,7 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
 
     folder.mkdir(parents=True, exist_ok=True)
     metadata = dict(year=int(year), identifier=identifier, bbox=list(bbox),
+                    bbox_crs=bbox_crs.to_wkt(), search_bbox_wgs84=list(search_bbox),
                     crs=crs.to_wkt(), transform=list(affine)[:6], width=width, height=height,
                     template=str(template) if template else None, mask_values_kept=[0],
                     resampling=resampling, mask_resampling="nearest",
@@ -344,7 +387,7 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                 results = maap.searchGranule(
                     cmr_host="cmr.earthdata.nasa.gov", short_name="OPERA_L2_RTC-S1_V1",
                     temporal=f"{begin.strftime('%Y-%m-%dT%H:%M:%SZ')},{finish.strftime('%Y-%m-%dT%H:%M:%SZ')}",
-                    bounding_box=",".join(map(str, bbox)), limit=max_results)
+                    bounding_box=",".join(map(str, search_bbox)), limit=max_results)
                 if len(results) >= max_results:
                     raise RuntimeError(f"{season} search reached max_results; increase it or use smaller tiles")
                 groups = _records(results, begin, finish)

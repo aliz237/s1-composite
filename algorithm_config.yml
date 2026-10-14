@@ -16,7 +16,7 @@ inputs:
   config: []
   positional:
     - name: bbox
-      description: WGS84 west,south,east,north, as one comma-separated string; no dateline crossing.
+      description: xmin,ymin,xmax,ymax as one comma-separated string in bbox_crs; no dateline crossing.
       default: ''
       required: true
     - name: year
@@ -50,4 +50,8 @@ inputs:
     - name: write_stac
       description: true or false; disable to write just the raster and processing manifest without STAC.
       default: 'true'
+      required: false
+    - name: bbox_crs
+      description: CRS of bbox coordinates; EPSG/PROJ/WKT or @custom_albers.wkt. Matching output CRS preserves bounds and grid origin.
+      default: EPSG:4326
       required: false
