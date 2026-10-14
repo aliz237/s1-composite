@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local composite inputs and outputs
+*.py[cod]
+input/
+output/
+.venv/
+.DS_Store
+
+# Interactive notebook is distributed separately from the DPS repository.
+opera_seasonal_mean.ipynb

@@ -1,0 +1,24 @@
+name: sar_s1_dps
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - ca-certificates
+  - numpy=1.24.4
+  - rasterio=1.4.4
+  - boto3>=1.34.139,<2
+  - pystac=1.15.2
+  - rio-stac=0.12.0
+  - jsonschema=4.26.0
+  - pyyaml=6.0.3
+  # MAAP SDK runtime dependencies also come from conda-forge.
+  - backoff>=2.2.1,<3
+  - configparser>=7,<8
+  - importlib_resources>=6.4,<7
+  - mapboxgl=0.10.2
+  - requests>=2.32.3,<3
+  - pip:
+      # Tagged source archive: keeps the legacy SDK interface without requiring git.
+      - maap-py @ https://github.com/MAAP-Project/maap-py/archive/refs/tags/v4.2.0.tar.gz

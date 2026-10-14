@@ -1,0 +1,61 @@
+# Template for the registration interface in the supplied MAAP DPS tutorial.
+# Copy this package's CONTENTS to your future public repository root.
+# Repository and current branch are configured; registration uses remote code.
+algorithm_name: sar-s1-seasonal-rtc
+algorithm_description: >-
+  Three seasonal Sentinel-1 OPERA RTC VV/VH means and valid-pass counts for
+  one bounding box and year. Mask and reproject native bursts, composite
+  with equal-pass weighting, then apply NumPy Refined Lee to seasonal means.
+  Writes a 12-band COG with -9999 nodata,
+  processing manifest, and optionally a STAC item and DPS STAC catalog.
+algorithm_version: main
+repository_url: https://github.com/aliz237/s1-composite.git
+build_command: s1-composite/build-env.sh
+run_command: s1-composite/run.sh
+docker_container_url: mas.maap-project.org/root/maap-workspaces/custom_images/maap_base:v4.2.0
+queue: maap-dps-worker-16gb
+disk_space: 20GB
+inputs:
+  config: []
+  file:
+    - name: template
+      description: Optional reference raster URL; DPS stages it in input/ to define the exact output grid.
+      default: ''
+      required: false
+  positional:
+    - name: bbox
+      description: WGS84 west,south,east,north, as one comma-separated string; no dateline crossing.
+      default: ''
+      required: true
+    - name: year
+      description: Acquisition year; all three seasons stay within this year.
+      default: '2020'
+      required: true
+    - name: tile_identifier
+      description: Tile or area identifier for SAR_S1_YEAR_IDENTIFIER.tif.
+      default: ''
+      required: true
+    - name: crs
+      description: Explicit EPSG/PROJ/WKT or @custom_albers.wkt; required without a template. No default CRS.
+      default: ''
+      required: false
+    - name: spacing
+      description: Output spacing in metres; ignored if a template is supplied.
+      default: '30'
+      required: false
+    - name: resampling
+      description: Backscatter resampling nearest, bilinear or average. Masks always use nearest.
+      default: nearest
+      required: false
+    - name: speckle_filter
+      description: true or false; NumPy Refined Lee once on each seasonal mean after compositing.
+      default: 'true'
+      required: false
+    - name: season_windows
+      description: Compact JSON month-day interval pairs; {} uses the standard frozen/summer/shoulder windows.
+      default: '{}'
+      required: false
+    - name: write_stac
+      description: true or false; disable to write just the raster and processing manifest without STAC.
+      default: 'true'
+      required: false
