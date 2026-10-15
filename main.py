@@ -54,7 +54,7 @@ def parser():
                    help="Fill missing means from nearest complete same-season donor years; record provenance in the optional metadata companion")
     p.add_argument("--max-gap-years", type=int, default=1)
     p.add_argument("--gap-min-pixels", type=int, default=1024,
-                   help="Minimum size of an 8-connected original missing patch eligible for donor filling")
+                   help="Minimum size of an 8-connected missing patch, rechecked before further donors")
     p.add_argument("--gap-core-size", type=int, default=7,
                    help="Odd side length of a fully missing square core required within an eligible patch")
     p.add_argument("--write-meta", type=parse_bool, default=False,

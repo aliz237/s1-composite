@@ -52,7 +52,7 @@ class FakeMAAP:
 
 
 class GapFillTests(unittest.TestCase):
-    def test_nearest_year_quality_tie_and_immutable_counts(self):
+    def test_first_valid_previous_precedence_and_immutable_counts(self):
         counts = np.array([[[1, 0, 0, 0]], [[1, 0, 0, 0]]], dtype="uint32")
         before = counts.copy()
         mean = np.where(counts, 10, np.nan).astype("float32")
@@ -64,7 +64,7 @@ class GapFillTests(unittest.TestCase):
                 n[..., :3] = 2
             elif year == 2021:
                 n[..., :3] = 2
-                n[0, 0, 1] = 3  # Following year wins for VV, preceding for VH.
+                n[0, 0, 1] = 3  # More following-year passes must not replace a selected prior donor.
             elif year == 2018:
                 n[...] = 4
             else:
@@ -73,11 +73,11 @@ class GapFillTests(unittest.TestCase):
         out, years, doy, used, attempts = m._fill_season(mean, counts, 2020, 46,
                                                         np.ones((1, 4), bool), 3, load)
         np.testing.assert_array_equal(counts, before)
-        np.testing.assert_array_equal(years, [[[2020, 2021, 2019, 2018]], [[2020, 2019, 2019, 2018]]])
+        np.testing.assert_array_equal(years, [[[2020, 2019, 2019, 2018]], [[2020, 2019, 2019, 2018]]])
         self.assertEqual(out[0, 0, 0], 10)
-        self.assertEqual(used[0, 0, 1], 3)
+        self.assertEqual(used[0, 0, 1], 2)
         self.assertEqual(doy[0, 0, 0], 46)
-        self.assertEqual(loaded, [2019, 2021, 2018, 2022])
+        self.assertEqual(loaded, [2019, 2021, 2018])
 
     def test_no_donor_work_when_target_complete(self):
         n = np.ones((2, 2, 2), dtype="uint32")
@@ -236,7 +236,7 @@ class GapFillTests(unittest.TestCase):
                 self.assertEqual(src.count, 6)
                 self.assertEqual(src.transform, from_origin(400000, 7200000, 30, 30))
                 for b in (1, 2):
-                    np.testing.assert_array_equal(src.read(b)[0, :5], [20, 19, 21, 21, -9999])
+                    np.testing.assert_array_equal(src.read(b)[0, :5], [20, 19, 19, 21, -9999])
                 self.assertEqual(src.tags(ns="IMAGE_STRUCTURE")["LAYOUT"], "COG")
                 affine, crs = src.transform, src.crs
             with rasterio.open(result["meta_cog"]) as src:
@@ -249,12 +249,12 @@ class GapFillTests(unittest.TestCase):
                 qa_values = src.read(1)
                 detailed = m.decode_meta(qa_values, 2020)
                 for pol in ("vv", "vh"):
-                    np.testing.assert_array_equal(detailed[f"{pol}_frozen"]["source_year"][0, :5], [2020, 2019, 2021, 2021, -9999])
+                    np.testing.assert_array_equal(detailed[f"{pol}_frozen"]["source_year"][0, :5], [2020, 2019, 2019, 2021, -9999])
                     np.testing.assert_array_equal(detailed[f"{pol}_frozen"]["source_doy"][0, :5], [46, 46, 46, 46, -9999])
-                    np.testing.assert_array_equal(detailed[f"{pol}_frozen"]["source_count"][0, :5], [1, 2, 3, 3, 0])
+                    np.testing.assert_array_equal(detailed[f"{pol}_frozen"]["source_count"][0, :5], [1, 2, 2, 3, 0])
                     np.testing.assert_array_equal(detailed[f"{pol}_frozen"]["target_count"][0, :5], [1, 0, 0, 0, 0])
             meta = json.loads(Path(result["manifest"]).read_text())
-            self.assertEqual(meta["seasons"]["frozen"]["source_year_pixels"]["VV"]["2021"], 32)
+            self.assertEqual(meta["seasons"]["frozen"]["source_year_pixels"]["VV"]["2021"], 16)
             self.assertEqual(meta["source_temporal_extent"]["start"], "2019-01-01T00:00:00+00:00")
             self.assertEqual(meta["source_temporal_extent"]["end_exclusive"], "2021-04-01T00:00:00+00:00")
             self.assertEqual(len(maap.searches), 5)

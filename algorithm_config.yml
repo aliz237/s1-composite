@@ -5,7 +5,7 @@ algorithm_description: >-
   NumPy Refined Lee to seasonal means. Optional nearest-year filling of substantial connected missing patches.
   Writes six Float32 means in a 6-band COG with -9999 nodata, processing
   manifest, optional single-band Int64 exact-count/provenance COG, and optional DPS STAC.
-algorithm_version: v0.1.0-rc.4
+algorithm_version: v0.1.0-rc.5
 repository_url: https://github.com/aliz237/s1-composite.git
 build_command: s1-composite/build-env.sh
 run_command: s1-composite/run.sh
@@ -60,7 +60,7 @@ inputs:
       default: 'false'
       required: false
     - name: max_gap_years
-      description: Maximum donor distance 0-3 in calendar years, both directions; nearest first, more valid passes breaks equal-distance ties.
+      description: Maximum donor distance 0-3 in calendar years; search -1,+1,-2,+2,-3,+3, keeping the first valid donor. Following years only process unresolved qualifying gaps.
       default: '1'
       required: false
     - name: as_of
@@ -72,7 +72,7 @@ inputs:
       default: 'false'
       required: false
     - name: gap_min_pixels
-      description: Minimum original missing component size in pixels, using 8-connectivity; smaller patches trigger no donor searches. Set 1 with gap_core_size 1 for rc.2 all-gap behavior.
+      description: Minimum missing component size in pixels, using 8-connectivity; reapplied to residual gaps before further donor searches. Set 1 with gap_core_size 1 for rc.2 all-gap behavior.
       default: '1024'
       required: false
     - name: gap_core_size

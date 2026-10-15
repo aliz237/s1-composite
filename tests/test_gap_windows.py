@@ -58,9 +58,9 @@ class GapWindowsTests(unittest.TestCase):
             return np.ones(n.shape,'float32'),counts,{'year':year,'nominal_doy':46}
         m._fill_season(np.full(n.shape,np.nan,'float32'),n,2020,46,np.ones((1,3),bool),2,load)
         np.testing.assert_array_equal(requested[2019], [[True,True,True]])
-        np.testing.assert_array_equal(requested[2021], [[True,True,True]])
+        np.testing.assert_array_equal(requested[2021], [[False,True,True]])
         np.testing.assert_array_equal(requested[2018], [[False,False,True]])
-        np.testing.assert_array_equal(requested[2022], [[False,False,True]])
+        self.assertNotIn(2022, requested)
 
     def test_real_raster_sparse_and_dense_donors_match_full_tile(self):
         shape = (320,340)
@@ -118,7 +118,7 @@ class GapWindowsTests(unittest.TestCase):
                         np.testing.assert_array_equal(a.read(),b.read())
                     meta=json.loads(Path(sparse['manifest']).read_text())
                     used=[d for d in meta['seasons']['frozen']['donors'] if d['status']=='processed']
-                    self.assertEqual(len(used),2)
+                    self.assertEqual(len(used),1)
                     if kind=='sparse' and mode=='nearest':
                         self.assertTrue(all(d['processed_grid_pixels'] < shape[0]*shape[1] for d in used))
                         self.assertTrue(all(h*w < shape[0]*shape[1] for year,h,w in sparse_calls if year!=2020))

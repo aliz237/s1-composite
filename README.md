@@ -62,11 +62,11 @@ pip-installed scientific packages.
 ## Register on MAAP
 
 The registration configuration targets
-[aliz237/s1-composite](https://github.com/aliz237/s1-composite), release tag `v0.1.0-rc.4`:
+[aliz237/s1-composite](https://github.com/aliz237/s1-composite), release tag `v0.1.0-rc.5`:
 
 ```yaml
 repository_url: https://github.com/aliz237/s1-composite.git
-algorithm_version: v0.1.0-rc.4
+algorithm_version: v0.1.0-rc.5
 build_command: s1-composite/build-env.sh
 run_command: s1-composite/run.sh
 ```
@@ -116,7 +116,7 @@ The ordered positional fields are:
 | 12 | `max_gap_years` | `1`; maximum distance in either direction, 0–3 supported |
 | 13 | `as_of` | Empty = UTC job start; optional exclusive ISO data cutoff |
 | 14 | `write_meta` | `false`; optional compact COG with exact counts and source provenance |
-| 15 | `gap_min_pixels` | `1024`; minimum 8-connected original missing-patch area |
+| 15 | `gap_min_pixels` | `1024`; minimum 8-connected missing-patch area; rechecked after donors |
 | 16 | `gap_core_size` | `7`; require a fully missing 7×7 core; positive odd integer |
 
 The Python CLI also accepts a local `--template` or one staged file in `input/`.
@@ -135,7 +135,7 @@ formatted as a CMR string. Do not submit a Python tuple as the DPS parameter.
 job = maap.submitJob(
     identifier="s1-2020-3364",        # DPS job tag
     algo_id="s1-seasonal-rtc",
-    version="v0.1.0-rc.4",
+    version="v0.1.0-rc.5",
     queue="maap-dps-worker-16gb",
     bbox="1358522,3123304,1448522,3213304",
     bbox_crs="@custom_albers.wkt",   # Bounds are in Albers metres.
@@ -286,8 +286,9 @@ If no component qualifies, the season makes **zero donor searches or reads**.
 For example, 413 or 418 missing pixels cannot reach the default threshold, even
 if all are connected; thousands of isolated single pixels cannot add up to a
 qualifying component either. A large contiguous swath gap remains eligible.
-Eligibility is calculated once: farther donor years may finish unresolved
-pixels within an originally qualifying patch without reclassifying its size.
+After each donor, unresolved gaps must still meet the same area and core
+requirements before another donor is loaded. If only small remnants remain,
+they stay nodata and all remaining donor years are skipped.
 
 Configure `gap_min_pixels` and `gap_core_size` through Python, CLI or DPS.
 Use `gap_min_pixels="1", gap_core_size="1"` to restore rc.2's all-gap behavior.
@@ -299,9 +300,13 @@ Each
 season is processed separately using the same month/day window in donor years.
 Only missing means are replaced; valid target-year pixels are preserved.
 Candidates are searched at ±1 year, then ±2, up to `max_gap_years`. The nearest
-valid year wins per pixel/polarization. Both directions at an equal distance
-are evaluated; more valid passes wins, and an exact count tie uses the preceding
-year deterministically. Values from different years are not averaged together.
+valid year wins per pixel/polarization, trying the preceding year first:
+`-1, +1, -2, +2, -3, +3` (bounded by `max_gap_years`). Each candidate only
+processes still-unresolved qualifying gaps. The first valid donor is kept,
+regardless of how many passes a later donor might have. When the preceding year
+fills the hole, the following year is never searched or read. Values from
+different years are not averaged together. This rc.5 policy replaces the earlier
+comparison of both directions by pass count.
 One polarization may select a different year, so provenance is per polarization.
 Do not interpret a mixed-year VV/VH ratio as a contemporaneous observation.
 
@@ -313,9 +318,8 @@ filtering use adaptive windows
 around eligible missing pixels, with a three-pixel border when Refined Lee is
 enabled. Small/scattered gaps use small windows; dense or fully missing areas
 use larger windows rather than many tiny requests. The target year still uses
-the full tile. Both equally distant donor years are evaluated at the same gap
-locations so the count-based tie rule is preserved. Farther years process only
-still-unresolved gaps.
+the full tile. Following and farther years process only still-unresolved gaps
+that continue to qualify under the patch policy.
 
 Catalog searches still discover the same seasonal acquisitions for the tile.
 Conservative catalog footprint bounds prune bursts far from each donor window;

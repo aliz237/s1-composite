@@ -117,10 +117,10 @@ class GapPolicyTests(unittest.TestCase):
         masks[0,:,80,80]=True
         with tempfile.TemporaryDirectory() as tmp:
             result,maap=self.run_job(tmp,masks)
-            self.assertEqual(len(maap.searches),5)
+            self.assertEqual(len(maap.searches),4)
             with rasterio.open(result['cog']) as src:
                 vv,vh=src.read((1,2))
-                self.assertTrue((vv[10:42,10:42]==np.float32(2.021)).all())
+                self.assertTrue((vv[10:42,10:42]==np.float32(2.019)).all())
                 self.assertTrue((vh[10:42,10:42]==np.float32(2.020)).all())
                 self.assertEqual(vv[80,80],-9999)
                 self.assertEqual(vh[80,80],-9999)
@@ -128,7 +128,49 @@ class GapPolicyTests(unittest.TestCase):
                 fields=m.decode_meta(src.read(1),2020)
                 self.assertEqual(int(fields['vv_frozen']['gap_filled'].sum()),1024)
                 self.assertFalse(fields['vh_frozen']['gap_filled'].any())
-                self.assertTrue((fields['vv_frozen']['source_count'][10:42,10:42]==3).all())
+                self.assertTrue((fields['vv_frozen']['source_count'][10:42,10:42]==2).all())
+
+    def test_residual_specks_skip_following_and_farther_years(self):
+        counts = np.zeros((2, 64, 64), dtype="uint32")
+        mean = np.full(counts.shape, np.nan, "float32")
+        residual = np.zeros((64, 64), bool)
+        residual[10:29, 10:32] = True  # 418 remaining pixels: below minimum.
+        loaded = []
+        def load(year, *, donor, needed):
+            loaded.append(year)
+            n = np.full(counts.shape, 2, "uint32")
+            n[:, residual] = 0
+            return np.full(mean.shape, year, "float32"), n, {"year": year, "nominal_doy": 46}
+        with contextlib.redirect_stdout(io.StringIO()):
+            out, years, _, selected, _ = m._fill_season(mean, counts, 2020, 46,
+                np.ones((64, 64), bool), 3, load,
+                gap_min_pixels=1024, gap_core_size=7)
+        self.assertEqual(loaded, [2019])
+        self.assertTrue((years[:, ~residual] == 2019).all())
+        self.assertTrue((years[:, residual] == 0).all())
+        self.assertTrue((selected[:, residual] == 0).all())
+
+    def test_substantial_residual_uses_following_only_where_still_missing(self):
+        counts = np.zeros((2, 64, 64), dtype="uint32")
+        mean = np.full(counts.shape, np.nan, "float32")
+        residual = np.zeros((64, 64), bool)
+        residual[16:48, 16:48] = True
+        requested = {}
+        def load(year, *, donor, needed):
+            requested[year] = needed.copy()
+            n = np.full(counts.shape, 2 if year == 2019 else 9, "uint32")
+            if year == 2019:
+                n[1, residual] = 0  # VV already complete; only VH needs next year.
+            return np.full(mean.shape, year, "float32"), n, {"year": year, "nominal_doy": 46}
+        out, years, _, selected, _ = m._fill_season(mean, counts, 2020, 46,
+            np.ones((64, 64), bool), 3, load,
+            gap_min_pixels=1024, gap_core_size=7)
+        self.assertEqual(list(requested), [2019, 2021])
+        np.testing.assert_array_equal(requested[2021], residual)
+        self.assertTrue((years[0] == 2019).all())
+        self.assertTrue((years[1, residual] == 2021).all())
+        self.assertTrue((years[1, ~residual] == 2019).all())
+        self.assertTrue((selected[0] == 2).all())
 
 
 if __name__=='__main__':

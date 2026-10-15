@@ -277,12 +277,15 @@ def _eligible_gap_mask(missing, min_pixels, core_size):
     return eligible, stats
 
 
-def _fill_season(mean, nobs, year, nominal_doy, inside, max_gap_years, load, eligible_gaps=None):
+def _fill_season(mean, nobs, year, nominal_doy, inside, max_gap_years, load, eligible_gaps=None,
+                 gap_min_pixels=1, gap_core_size=1):
     """Select the nearest valid donor per polarization; do not mutate nobs.
 
-    Both directions at the same distance are evaluated. More valid passes wins;
-    an exact count tie keeps the preceding year (visited first). Never overwrite
-    observed target-year values or average different donor years together.
+    Search -1, +1, -2, +2, ... and keep the first valid donor per pixel and
+    polarization. Following years see only still-unresolved eligible gaps;
+    stop without loading another donor once these are filled. Never overwrite
+    target-year values or previously selected donors, regardless of counts.
+    Reapply the patch policy to residual gaps before subsequent donor attempts.
     """
     valid = (nobs > 0) & inside[None]
     source_year = np.where(valid, year, 0).astype("int16")
@@ -298,13 +301,25 @@ def _fill_season(mean, nobs, year, nominal_doy, inside, max_gap_years, load, eli
         if not np.any(original_gap & (source_year == 0)):
             break
         for candidate in (year - distance, year + distance):
+            eligible = original_gap & (source_year == 0)
+            if not np.any(eligible):
+                break
+            if attempts and (gap_min_pixels > 1 or gap_core_size > 1):
+                for k in range(2):
+                    if k == 1 and np.array_equal(original_gap[0] & (source_year[0] == 0), eligible[k]):
+                        eligible[k] = eligible[0]
+                    else:
+                        eligible[k], _ = _eligible_gap_mask(eligible[k], gap_min_pixels, gap_core_size)
+                # Once residuals become specks, exclude them from every farther candidate.
+                original_gap &= (source_year != 0) | eligible
+                if not np.any(eligible):
+                    print("No qualifying residual missing patches; skipping remaining donor years", flush=True)
+                    return mean, source_year, source_doy, source_count, attempts
             if not ARCHIVE_START.year <= candidate <= 9998:
                 continue
-            eligible = original_gap & ((source_year == 0) | (np.abs(source_year - year) == distance))
             donor_mean, donor_count, info = load(candidate, donor=True, needed=np.any(eligible, axis=0))
             if donor_count is not None:
                 use = eligible & (donor_count > 0) & np.isfinite(donor_mean) & (donor_mean != NODATA)
-                use &= (source_year == 0) | (donor_count > source_count)
                 mean[use] = donor_mean[use]
                 source_count[use] = donor_count[use]
                 source_year[use] = candidate
@@ -589,9 +604,11 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
     resampling: nearest (default), bilinear, average. A template uses its full
     grid with the bbox mask. Refined Lee is applied once per source-year mean.
     gap_fill=True searches complete same-season donors within max_gap_years
-    (0-3), preserving observed values. Only 8-connected original missing patches
+    (0-3), previous year first at each distance, keeping the first valid donor.
+    Preserve observed values. Only 8-connected missing patches
     with at least gap_min_pixels (1024) and a missing gap_core_size square core
-    (7x7) are eligible; skipped holes remain nodata without donor searches.
+    (7x7) are eligible; recheck residual patches before subsequent donors.
+    Skipped holes remain nodata without donor searches.
     Set gap_min_pixels=1 and gap_core_size=1 for rc.2 all-gap behavior.
     as_of is an exclusive UTC cutoff,
     default now; incomplete seasons are never donors. write_stac=True adds
@@ -713,10 +730,11 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                     filter_stage="after_seasonal_compositing" if speckle_filter else "none",
                     as_of=cutoff.isoformat(), archive_start=ARCHIVE_START.isoformat(),
                     gap_fill=dict(enabled=gap_fill, max_gap_years=int(max_gap_years),
-                                  selection="nearest_year_then_more_valid_passes_per_polarization",
-                                  exact_tie="preceding_year", donors_require_complete_season=True,
+                                  selection="nearest_year_previous_first_first_valid_per_polarization",
+                                  candidate_order="-1,+1,-2,+2,-3,+3 (bounded by max_gap_years)",
+                                  compare_donor_counts=False, recheck_residual_patches=True, donors_require_complete_season=True,
                                   eligibility=dict(min_pixels=int(gap_min_pixels), core_size=int(gap_core_size),
-                                      connectivity=8, scope="original_target_mask_per_polarization", outside_tile="excluded"),
+                                      connectivity=8, scope="original_and_residual_masks_per_polarization", outside_tile="excluded"),
                                   spatial_processing="adaptive_gap_windows_nearest",
                                   other_resampling="full_tile_to_preserve_warp_results",
                                   donor_filter_halo_pixels=HALO if speckle_filter else 0,
@@ -858,7 +876,8 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                     if not np.any(eligible_gaps):
                         print(f"{season}: no qualifying missing patches; skipping all donor searches", flush=True)
                     mean, source_year, source_doy, selected_count, donors = _fill_season(
-                        mean, nobs, year, info["nominal_doy"], inside, max_gap_years, load_season, eligible_gaps)
+                        mean, nobs, year, info["nominal_doy"], inside, max_gap_years, load_season, eligible_gaps,
+                        gap_min_pixels=gap_min_pixels, gap_core_size=gap_core_size)
                     del eligible_gaps
                     year_pixels = {pol: {str(int(y)): int(np.count_nonzero(source_year[k] == y))
                                         for y in np.unique(source_year[k]) if y}
