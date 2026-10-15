@@ -62,11 +62,11 @@ pip-installed scientific packages.
 ## Register on MAAP
 
 The registration configuration targets
-[aliz237/s1-composite](https://github.com/aliz237/s1-composite), release tag `v0.1.0-rc.3`:
+[aliz237/s1-composite](https://github.com/aliz237/s1-composite), release tag `v0.1.0-rc.4`:
 
 ```yaml
 repository_url: https://github.com/aliz237/s1-composite.git
-algorithm_version: v0.1.0-rc.3
+algorithm_version: v0.1.0-rc.4
 build_command: s1-composite/build-env.sh
 run_command: s1-composite/run.sh
 ```
@@ -135,7 +135,7 @@ formatted as a CMR string. Do not submit a Python tuple as the DPS parameter.
 job = maap.submitJob(
     identifier="s1-2020-3364",        # DPS job tag
     algo_id="s1-seasonal-rtc",
-    version="v0.1.0-rc.3",
+    version="v0.1.0-rc.4",
     queue="maap-dps-worker-16gb",
     bbox="1358522,3123304,1448522,3213304",
     bbox_crs="@custom_albers.wkt",   # Bounds are in Albers metres.
@@ -329,7 +329,9 @@ cropping those reads can change values. This preserves their existing behavior;
 the sparse-read speedup currently applies to nearest (the default). See the
 [GDAL warping FAQ](https://gdal.org/en/stable/programs/gdalwarp.html#frequently-asked-questions). Runtime still depends on actual
 gap coverage, source I/O and the number of donor years. SciPy supplies compiled
-component labeling and neighborhood filtering, installed through conda-forge.
+component labeling and neighborhood filtering, installed through conda-forge
+with `scipy>=1.11,<1.16`. The APIs used do not require SciPy 1.15.3; the range
+allows available builds compatible with the pinned Python 3.11 and NumPy 1.24.4.
 
 Logs and donor manifest entries record gap-pixel counts, window dimensions,
 processed pixels including halos, burst-window reads, and elapsed seconds. For
