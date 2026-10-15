@@ -62,11 +62,11 @@ pip-installed scientific packages.
 ## Register on MAAP
 
 The registration configuration targets
-[aliz237/s1-composite](https://github.com/aliz237/s1-composite), release tag `v0.1.0-rc.2`:
+[aliz237/s1-composite](https://github.com/aliz237/s1-composite), release tag `v0.1.0-rc.3`:
 
 ```yaml
 repository_url: https://github.com/aliz237/s1-composite.git
-algorithm_version: v0.1.0-rc.2
+algorithm_version: v0.1.0-rc.3
 build_command: s1-composite/build-env.sh
 run_command: s1-composite/run.sh
 ```
@@ -116,6 +116,8 @@ The ordered positional fields are:
 | 12 | `max_gap_years` | `1`; maximum distance in either direction, 0–3 supported |
 | 13 | `as_of` | Empty = UTC job start; optional exclusive ISO data cutoff |
 | 14 | `write_meta` | `false`; optional compact COG with exact counts and source provenance |
+| 15 | `gap_min_pixels` | `1024`; minimum 8-connected original missing-patch area |
+| 16 | `gap_core_size` | `7`; require a fully missing 7×7 core; positive odd integer |
 
 The Python CLI also accepts a local `--template` or one staged file in `input/`.
 A template copies its full projection, transform, dimensions and extent; bbox
@@ -133,7 +135,7 @@ formatted as a CMR string. Do not submit a Python tuple as the DPS parameter.
 job = maap.submitJob(
     identifier="s1-2020-3364",        # DPS job tag
     algo_id="s1-seasonal-rtc",
-    version="v0.1.0-rc.2",
+    version="v0.1.0-rc.3",
     queue="maap-dps-worker-16gb",
     bbox="1358522,3123304,1448522,3213304",
     bbox_crs="@custom_albers.wkt",   # Bounds are in Albers metres.
@@ -147,6 +149,8 @@ job = maap.submitJob(
     write_stac="false",             # Use "true" to emit item + catalog
     gap_fill="true",                # Fill missing seasonal means; write_meta retains per-pixel provenance.
     write_meta="false",             # Set true to retain exact per-pixel counts.
+    gap_min_pixels="1024",          # Skip small connected holes.
+    gap_core_size="7",              # Require a fully missing 7x7 core.
     max_gap_years="1",              # Check both adjacent years.
     as_of="2026-10-14",             # Optional: no data on/after this UTC midnight.
 )
@@ -263,7 +267,35 @@ fresh job directories. Progress goes to stdout, which DPS also preserves.
 
 ## Optional nearest-year gap filling
 
-Enable with `gap_fill="true"`; both modes use the same six-band schema. Each
+Enable with `gap_fill="true"`; both modes use the same six-band schema.
+
+**rc.3 fills substantial missing patches, not isolated specks.** A patch must
+contain at least **1,024 missing pixels** and a **fully missing 7×7 square core**.
+At 30 m, the default minimum area is 0.9216 km² and the core spans 210 m per side.
+The area threshold is in pixels: adjust it if using another spacing.
+
+Eligibility uses 8-connectivity (edge or corner adjacency), separately for VV
+and VH, on the original target-year count-zero mask inside the requested tile.
+Outside-tile pixels do not enlarge components or supply missing neighbors.
+The core requirement rejects long narrow edge defects; a qualifying component
+is filled all the way to its edge, not just within its eroded core. Skipped
+pixels remain -9999 in means with source count zero and missing source codes.
+Valid target-year observations are never replaced.
+
+If no component qualifies, the season makes **zero donor searches or reads**.
+For example, 413 or 418 missing pixels cannot reach the default threshold, even
+if all are connected; thousands of isolated single pixels cannot add up to a
+qualifying component either. A large contiguous swath gap remains eligible.
+Eligibility is calculated once: farther donor years may finish unresolved
+pixels within an originally qualifying patch without reclassifying its size.
+
+Configure `gap_min_pixels` and `gap_core_size` through Python, CLI or DPS.
+Use `gap_min_pixels="1", gap_core_size="1"` to restore rc.2's all-gap behavior.
+Logs and the manifest report original, eligible and skipped missing-pixel
+counts per season/polarization, qualifying-component counts and actual fills.
+The optional Int64 companion format is unchanged.
+
+Each
 season is processed separately using the same month/day window in donor years.
 Only missing means are replaced; valid target-year pixels are preserved.
 Candidates are searched at ±1 year, then ±2, up to `max_gap_years`. The nearest
@@ -296,14 +328,14 @@ processing: GDAL's resampling scales can depend on warp-window geometry, so
 cropping those reads can change values. This preserves their existing behavior;
 the sparse-read speedup currently applies to nearest (the default). See the
 [GDAL warping FAQ](https://gdal.org/en/stable/programs/gdalwarp.html#frequently-asked-questions). Runtime still depends on actual
-gap coverage, source I/O and the number of donor years. No extra dependency is
-required.
+gap coverage, source I/O and the number of donor years. SciPy supplies compiled
+component labeling and neighborhood filtering, installed through conda-forge.
 
 Logs and donor manifest entries record gap-pixel counts, window dimensions,
 processed pixels including halos, burst-window reads, and elapsed seconds. For
 a mostly empty tile, substantial donor processing is expected; isolated missing
-pixels no longer trigger full-tile donor raster reads and filtering with nearest
-resampling.
+pixels below the eligibility thresholds trigger no donor work at all. Eligible
+patches use windowed donor reads with nearest resampling.
 
 Nominal DOY is the UTC calendar day containing the midpoint of the source
 season's [start, exclusive end) interval, calculated in the source year (leap
@@ -335,6 +367,30 @@ Run the offline regression checks in the installed environment with
 `python -m unittest discover -s tests -v`. STAC-enabled checks fetch public
 schemas. The DPS launcher notebook exposes these optional settings in
 `ALGO_PARAMS`; its existing planning/submission workflow is preserved.
+
+## Remote read recovery
+
+rc.3 retains GDAL HTTP retries (three retries for 429/500/502/503/504) and adds
+up to **three whole-burst attempts**, reopening VV, VH and mask handles each time.
+Retries wait 5 then 15 seconds, plus up to 2 seconds of jitter. Per-asset HTTP
+cache entries are discarded on handle close so a failed cached response is not
+reused. Credentials refresh before their reported expiration (two-minute margin,
+45-minute maximum refresh interval); an ambiguous remote TIFF error or explicit
+authentication error triggers one credential refresh before retrying.
+
+Explicit HTTP 404/NoSuchKey and local-file errors are not retried. A generic
+GDAL "does not exist" or TIFF read error is not treated as proof of a missing
+remote object and receives bounded recovery. Persistent authentication failure
+stops after one credential refresh; other persistent remote I/O failures stop
+after the bounded attempts. Failed observations are **never silently skipped**.
+Existing -9999 masks therefore continue to describe data coverage, not hidden
+network failures. The failed burst ID and attempt are logged without credentials.
+The outer attempts are in addition to GDAL's per-request retries, so a persistent
+failure can take longer than just the two outer sleep intervals.
+
+These settings follow the [GDAL HTTP/cache configuration options](https://gdal.org/en/stable/user/configoptions.html).
+A TIFF block/directory read error does not identify the underlying HTTP status;
+recovery does not establish that a particular failure was caused by throttling.
 
 ## Optional STAC
 

@@ -53,6 +53,10 @@ def parser():
     p.add_argument("--gap-fill", type=parse_bool, default=False,
                    help="Fill missing means from nearest complete same-season donor years; record provenance in the optional metadata companion")
     p.add_argument("--max-gap-years", type=int, default=1)
+    p.add_argument("--gap-min-pixels", type=int, default=1024,
+                   help="Minimum size of an 8-connected original missing patch eligible for donor filling")
+    p.add_argument("--gap-core-size", type=int, default=7,
+                   help="Odd side length of a fully missing square core required within an eligible patch")
     p.add_argument("--write-meta", type=parse_bool, default=False,
                    help="Write a single-band Int64 companion with exact counts 0-127 and source provenance")
     p.add_argument("--as-of", default=None, help="Exclusive UTC data cutoff; ISO date/time, default now")
@@ -94,6 +98,8 @@ def run_job(args, maap=None):
         raise ValueError("Target year must be within the OPERA archive through as_of")
     if not 0 <= args.max_gap_years <= 3:
         raise ValueError("max-gap-years must be between 0 and 3 (packed QA range)")
+    if args.gap_min_pixels < 1 or args.gap_core_size < 1 or args.gap_core_size % 2 != 1:
+        raise ValueError("gap-min-pixels must be positive; gap-core-size must be positive and odd")
     bbox_crs = resolve_bbox_crs(_job_crs_value(args.bbox_crs))
     bbox_coords(args.bbox, bbox_crs)
     template = staged_template(args)
@@ -116,7 +122,8 @@ def run_job(args, maap=None):
         season_windows=args.season_windows, max_results=args.max_results,
         max_pixels=args.max_pixels, filter_tile_size=args.filter_tile_size,
         overwrite=False, write_stac=args.write_stac, gap_fill=args.gap_fill,
-        max_gap_years=args.max_gap_years, as_of=cutoff, write_meta=args.write_meta)
+        max_gap_years=args.max_gap_years, as_of=cutoff, write_meta=args.write_meta,
+        gap_min_pixels=args.gap_min_pixels, gap_core_size=args.gap_core_size)
     log.info("Finished: %s", outputs["cog"])
     return outputs
 

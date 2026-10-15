@@ -184,7 +184,7 @@ class GapFillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(m, "_read_burst", side_effect=reader), contextlib.redirect_stdout(io.StringIO()):
             result = m.seasonal_composites(maap, "400000,7199520,400480,7200000", 2016, "boundary",
                 outdir=tmp, crs="EPSG:32606", bbox_crs="EPSG:32606", gap_fill=True,
-                as_of="2018-01-01", speckle_filter=False, write_meta=True)
+                as_of="2018-01-01", speckle_filter=False, write_meta=True, gap_min_pixels=1, gap_core_size=1)
             with rasterio.open(result["cog"]) as src:
                 self.assertTrue((src.read(1) == 1).all())
                 self.assertEqual(src.count, 6)
@@ -221,7 +221,7 @@ class GapFillTests(unittest.TestCase):
         with patch.object(m, "_read_burst", side_effect=reader), contextlib.redirect_stdout(io.StringIO()):
             result = m.seasonal_composites(maap, "400000,7199520,400480,7200000", 2020, "test",
                 outdir=folder, crs="EPSG:32606", bbox_crs="EPSG:32606", gap_fill=True,
-                as_of="2026-01-01", **options)
+                as_of="2026-01-01", gap_min_pixels=1, gap_core_size=1, **options)
         return result, maap
 
     def test_cog_provenance_filter_placement_and_original_counts(self):

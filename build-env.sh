@@ -8,7 +8,7 @@ conda env update --name sar_s1_dps --file "${_s1_package_dir}/environment.yml"
 conda run --no-capture-output --name sar_s1_dps python -c '
 from maap.maap import MAAP
 from importlib.metadata import version
-import rasterio, rio_stac, pystac, numpy, jsonschema
+import rasterio, rio_stac, pystac, numpy, scipy, jsonschema
 assert version("maap-py") == "4.2.0", "Unexpected MAAP SDK version"
 assert hasattr(MAAP, "searchGranule"), "Incompatible MAAP SDK"
 assert hasattr(MAAP, "register_algorithm_from_yaml_file"), "Incompatible MAAP SDK"

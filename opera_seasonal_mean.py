@@ -3,7 +3,8 @@
 Native-grid burst masking -> user-selected reprojection -> overlap mean within
 pass -> equal-pass seasonal mean -> optional NumPy Refined Lee on the mean.
 Write six Float32 means and an optional single-band Int64 metadata COG.
-Requires maap-py, numpy, rasterio, boto3 and the companion refined_lee.py.
+Requires maap-py, numpy, rasterio, boto3 and the companion refined_lee.py;
+SciPy supplies compiled component/neighborhood operations for gap eligibility.
 Season intervals are calendar dates [start, end), within the requested year.
 """
 
@@ -13,6 +14,7 @@ import json
 import math
 from pathlib import Path
 import re
+import random
 import tempfile
 import time
 from contextlib import ExitStack
@@ -241,7 +243,41 @@ def decode_meta(values, year, season_windows=None):
     return result
 
 
-def _fill_season(mean, nobs, year, nominal_doy, inside, max_gap_years, load):
+def _eligible_gap_mask(missing, min_pixels, core_size):
+    """Retain substantial 8-connected gaps containing a fully missing core.
+
+    Eligibility is computed on the original target-year mask, once per season
+    and polarization. The entire qualifying component (including its edge) is
+    eligible; erosion only tests its width, it does not trim the filled patch.
+    """
+    missing = np.asarray(missing, dtype=bool)
+    total = int(np.count_nonzero(missing))
+    eligible = np.zeros_like(missing)
+    stats = dict(missing_pixels=total, eligible_pixels=0, skipped_pixels=total,
+                 eligible_patches=0, largest_patch_pixels=0 if total == 0 else None)
+    # No label scan or donor query for a season with only a handful of holes.
+    if total < min_pixels:
+        return eligible, stats
+    from scipy import ndimage
+    labels, count = ndimage.label(missing, structure=np.ones((3, 3), dtype=bool))
+    sizes = np.bincount(labels.ravel(), minlength=count + 1)
+    sizes[0] = 0
+    has_core = np.zeros(count + 1, dtype=bool)
+    if core_size == 1:
+        has_core[1:] = True
+    else:
+        core = ndimage.minimum_filter(missing, size=core_size, mode="constant", cval=0)
+        has_core[labels[core]] = True
+    keep = (sizes >= min_pixels) & has_core
+    keep[0] = False
+    eligible = keep[labels]
+    stats.update(eligible_pixels=int(np.count_nonzero(eligible)),
+                 eligible_patches=int(np.count_nonzero(keep)), largest_patch_pixels=int(sizes.max()))
+    stats["skipped_pixels"] = total - stats["eligible_pixels"]
+    return eligible, stats
+
+
+def _fill_season(mean, nobs, year, nominal_doy, inside, max_gap_years, load, eligible_gaps=None):
     """Select the nearest valid donor per polarization; do not mutate nobs.
 
     Both directions at the same distance are evaluated. More valid passes wins;
@@ -253,6 +289,10 @@ def _fill_season(mean, nobs, year, nominal_doy, inside, max_gap_years, load):
     source_doy = np.where(valid, nominal_doy, 0).astype("int16")
     source_count = nobs.copy()
     original_gap = ~valid & inside[None]
+    if eligible_gaps is not None:
+        if eligible_gaps.shape != original_gap.shape:
+            raise ValueError("Gap eligibility mask must match both polarization grids")
+        original_gap &= eligible_gaps
     attempts = []
     for distance in range(1, max_gap_years + 1):
         if not np.any(original_gap & (source_year == 0)):
@@ -472,13 +512,67 @@ def _read_burst(record, *, crs, affine, width, height, inside, resampling):
     return destination, clear_target
 
 
+def _remote_error_kind(error):
+    messages, seen = [], set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        messages.append(str(error))
+        error = error.__cause__ or error.__context__
+    text = " ".join(messages).lower()
+    if "nosuchkey" in text or re.search(r"http(?: response)?(?: error)?(?: code)?\s*[:=]?\s*404\b", text):
+        return "not_found"
+    if any(token in text for token in ("expiredtoken", "invalidtoken", "signaturedoesnotmatch", "accessdenied")) or re.search(
+            r"http(?: response)?(?: error)?(?: code)?\s*[:=]?\s*(401|403)\b", text):
+        return "authentication"
+    if "slowdown" in text or re.search(r"\b(429|500|502|503|504)\b", text):
+        return "transient_http"
+    return "remote_io"
+
+
+def _retry_remote_read(operation, record, refresh, max_attempts=3):
+    """Retry a whole remote burst with fresh handles, never skip observations."""
+    from rasterio.errors import RasterioIOError
+    remote = any(str(url).startswith(("s3://", "https://")) for url in record["assets"].values())
+    refreshed = False
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return operation()
+        except RasterioIOError as error:
+            kind = _remote_error_kind(error)
+            if not remote or kind == "not_found":
+                raise
+            if attempt == max_attempts or kind == "authentication" and refreshed:
+                raise RasterioIOError(
+                    f"Remote burst read failed after {attempt} attempts: {record['id']} ({kind}); no observations skipped"
+                ) from error
+            if not refreshed and kind in ("authentication", "remote_io"):
+                # GDAL sometimes hides the HTTP status behind a TIFF read error.
+                refresh()
+                refreshed = True
+            delay = (5 if attempt == 1 else 15) + random.uniform(0, 2)
+            print(f"Remote burst {record['id']}: {kind}; retry {attempt + 1}/{max_attempts} "
+                  f"in {delay:.1f}s with reopened datasets", flush=True)
+            time.sleep(delay)
+
+
+def _credential_lifetime(credentials):
+    """Refresh before actual expiration, with a 45-minute fallback ceiling."""
+    expiration = credentials.get("expiration") or credentials.get("Expiration")
+    if expiration is None:
+        return 45 * 60
+    remaining = (_utc(str(expiration)) - datetime.now(timezone.utc)).total_seconds()
+    if remaining <= 60:
+        raise RuntimeError("Earthdata returned expired credentials or less than one minute of validity")
+    return max(1, min(45 * 60, remaining - 120))
+
+
 def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                         resampling="nearest", speckle_filter=True,
                         season_windows=None, crs=None, spacing=30,
                         template=None, max_results=20000, max_pixels=25000000,
                         filter_tile_size=512, overwrite=False, write_stac=False,
                         bbox_crs="EPSG:4326", gap_fill=False, max_gap_years=1,
-                        as_of=None, write_meta=False):
+                        as_of=None, write_meta=False, gap_min_pixels=1024, gap_core_size=7):
     """Write six Float32 seasonal means and optional packed Int64 metadata COG.
 
     Default windows: Jan 1-Mar 31, Jun 15-Aug 31, Sep 15-Oct 31. Custom
@@ -495,7 +589,11 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
     resampling: nearest (default), bilinear, average. A template uses its full
     grid with the bbox mask. Refined Lee is applied once per source-year mean.
     gap_fill=True searches complete same-season donors within max_gap_years
-    (0-3), preserving observed values. as_of is an exclusive UTC cutoff,
+    (0-3), preserving observed values. Only 8-connected original missing patches
+    with at least gap_min_pixels (1024) and a missing gap_core_size square core
+    (7x7) are eligible; skipped holes remain nodata without donor searches.
+    Set gap_min_pixels=1 and gap_core_size=1 for rc.2 all-gap behavior.
+    as_of is an exclusive UTC cutoff,
     default now; incomplete seasons are never donors. write_stac=True adds
     an optional item/catalog linking the composite, manifest and metadata COG.
     """
@@ -516,6 +614,11 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
         raise ValueError("gap_fill must be True or False")
     if isinstance(max_gap_years, bool) or not isinstance(max_gap_years, (int, np.integer)) or not 0 <= max_gap_years <= 3:
         raise ValueError("max_gap_years must be an integer between 0 and 3 (packed QA range)")
+    for name, value in (("gap_min_pixels", gap_min_pixels), ("gap_core_size", gap_core_size)):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if gap_core_size % 2 != 1:
+        raise ValueError("gap_core_size must be odd")
     filename = _output_name(year, identifier)
     bbox_crs = resolve_bbox_crs(bbox_crs)
     bbox = parse_bbox(bbox, bbox_crs)
@@ -564,23 +667,38 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
         raise ValueError("Bounding box does not intersect the template grid.")
 
     endpoint = "https://cumulus.asf.earthdatacloud.nasa.gov/s3credentials"
-    aws, refreshed_at = None, 0
+    aws, refresh_at = None, 0
 
-    def read(record, grid=None):
-        nonlocal aws, refreshed_at
-        if aws is None or time.monotonic() - refreshed_at > 45 * 60:
+    def invalidate_credentials():
+        nonlocal aws, refresh_at
+        aws, refresh_at = None, 0
+
+    def read_once(record, grid):
+        nonlocal aws, refresh_at
+        if aws is None or time.monotonic() >= refresh_at:
             credentials = maap.aws.earthdata_s3_credentials(endpoint)
+            lifetime = _credential_lifetime(credentials)
             aws = AWSSession(boto3.Session(
                 aws_access_key_id=credentials["accessKeyId"],
                 aws_secret_access_key=credentials["secretAccessKey"],
                 aws_session_token=credentials["sessionToken"], region_name="us-west-2"))
-            refreshed_at = time.monotonic()
+            refresh_at = time.monotonic() + lifetime
+        # Invalidate these assets' HTTP caches when their handles close, including
+        # failed reads, so retries reopen rather than reuse a poisoned response.
+        non_cached = ":".join("/vsis3/" + url[5:] if url.startswith("s3://") else url
+                              for url in record["assets"].values())
         with rasterio.Env(aws, GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
-                          GDAL_HTTP_MAX_RETRY="3", GDAL_HTTP_RETRY_DELAY="2"):
+                          GDAL_HTTP_MAX_RETRY="3", GDAL_HTTP_RETRY_DELAY="2",
+                          GDAL_HTTP_RETRY_CODES="429,500,502,503,504",
+                          GDAL_HTTP_CONNECTTIMEOUT="15", GDAL_HTTP_TIMEOUT="120",
+                          CPL_VSIL_CURL_NON_CACHED=non_cached):
             grid_affine, grid_inside = (affine, inside) if grid is None else grid
             grid_height, grid_width = grid_inside.shape
             return _read_burst(record, crs=crs, affine=grid_affine, width=grid_width,
                                height=grid_height, inside=grid_inside, resampling=allowed[resampling])
+
+    def read(record, grid=None):
+        return _retry_remote_read(lambda: read_once(record, grid), record, invalidate_credentials)
 
     folder.mkdir(parents=True, exist_ok=True)
     metadata = dict(year=int(year), identifier=identifier, bbox=list(bbox),
@@ -597,11 +715,15 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                     gap_fill=dict(enabled=gap_fill, max_gap_years=int(max_gap_years),
                                   selection="nearest_year_then_more_valid_passes_per_polarization",
                                   exact_tie="preceding_year", donors_require_complete_season=True,
+                                  eligibility=dict(min_pixels=int(gap_min_pixels), core_size=int(gap_core_size),
+                                      connectivity=8, scope="original_target_mask_per_polarization", outside_tile="excluded"),
                                   spatial_processing="adaptive_gap_windows_nearest",
                                   other_resampling="full_tile_to_preserve_warp_results",
                                   donor_filter_halo_pixels=HALO if speckle_filter else 0,
                                   original_counts="target_year_only",
                                   nominal_doy="UTC calendar day containing midpoint of source season window"),
+                    remote_read_recovery=dict(burst_attempts=3, http_retries=3, backoff_seconds=[5, 15],
+                        jitter_max_seconds=2, expiration_margin_seconds=120, skip_failed_bursts=False),
                     metadata_raster=(dict(filename=meta_final.name, dtype="int64", nodata=int(NODATA),
                         encoding_version=1, bits=60, bits_per_field=10,
                         source_bits=[0, 2], count_bits=[3, 9], count_max=META_MAX_COUNT,
@@ -720,8 +842,24 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                 selected_count = nobs
                 donors = []
                 if gap_fill:
+                    eligible_gaps = np.zeros_like(nobs, dtype=bool)
+                    eligibility = {}
+                    for k, pol in enumerate(("VV", "VH")):
+                        missing = (nobs[k] == 0) & inside
+                        if k == 1 and np.array_equal(nobs[0] == 0, nobs[1] == 0):
+                            eligible_gaps[k] = eligible_gaps[0]
+                            eligibility[pol] = eligibility["VV"].copy()
+                        else:
+                            eligible_gaps[k], eligibility[pol] = _eligible_gap_mask(missing, gap_min_pixels, gap_core_size)
+                    info["gap_eligibility"] = eligibility
+                    print(f"{season}: eligible gap pixels "
+                          f"{ {p: v['eligible_pixels'] for p,v in eligibility.items()} }; skipped "
+                          f"{ {p: v['skipped_pixels'] for p,v in eligibility.items()} }", flush=True)
+                    if not np.any(eligible_gaps):
+                        print(f"{season}: no qualifying missing patches; skipping all donor searches", flush=True)
                     mean, source_year, source_doy, selected_count, donors = _fill_season(
-                        mean, nobs, year, info["nominal_doy"], inside, max_gap_years, load_season)
+                        mean, nobs, year, info["nominal_doy"], inside, max_gap_years, load_season, eligible_gaps)
+                    del eligible_gaps
                     year_pixels = {pol: {str(int(y)): int(np.count_nonzero(source_year[k] == y))
                                         for y in np.unique(source_year[k]) if y}
                                    for k, pol in enumerate(("VV", "VH"))}

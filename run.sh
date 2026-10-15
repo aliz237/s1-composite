@@ -2,8 +2,8 @@
 set -euo pipefail
 
 _s1_package_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-if (( $# < 3 || $# > 14 )); then
-  echo 'Usage: run.sh BBOX YEAR IDENTIFIER [CRS_OR_EMPTY_WITH_TEMPLATE] [SPACING] [RESAMPLING] [SPECKLE_FILTER] [SEASON_WINDOWS_JSON] [WRITE_STAC] [BBOX_CRS] [GAP_FILL] [MAX_GAP_YEARS] [AS_OF] [WRITE_META]' >&2
+if (( $# < 3 || $# > 16 )); then
+  echo 'Usage: run.sh BBOX YEAR IDENTIFIER [CRS_OR_EMPTY_WITH_TEMPLATE] [SPACING] [RESAMPLING] [SPECKLE_FILTER] [SEASON_WINDOWS_JSON] [WRITE_STAC] [BBOX_CRS] [GAP_FILL] [MAX_GAP_YEARS] [AS_OF] [WRITE_META] [GAP_MIN_PIXELS] [GAP_CORE_SIZE]' >&2
   exit 2
 fi
 
@@ -24,6 +24,8 @@ exec conda run --no-capture-output --name sar_s1_dps \
   --max-gap-years="${12:-1}" \
   --as-of="${13:-}" \
   --write-meta="${14:-false}" \
+  --gap-min-pixels="${15:-1024}" \
+  --gap-core-size="${16:-7}" \
   --year="$2" \
   --identifier="$3" \
   --crs="${4:-}" \

@@ -106,7 +106,7 @@ class GapWindowsTests(unittest.TestCase):
                         return values,clear
                     common=dict(bbox=','.join(map(str,array_bounds(*shape,transform))),year=2020,
                                 identifier=kind+'_'+mode,crs='EPSG:32606',bbox_crs='EPSG:32606',gap_fill=True,
-                                write_meta=True,as_of='2026-01-01',resampling=mode)
+                                write_meta=True,as_of='2026-01-01',resampling=mode, gap_min_pixels=1, gap_core_size=1)
                     with patch.object(m,'_read_burst',side_effect=reader), contextlib.redirect_stdout(io.StringIO()):
                         sparse=m.seasonal_composites(FakeMAAP(),**common,outdir=folder/(kind+mode+'small'))
                         sparse_calls=calls.copy();calls.clear()
