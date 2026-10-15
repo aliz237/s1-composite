@@ -1,10 +1,10 @@
 algorithm_name: s1-seasonal-rtc
 algorithm_description: >-
-  Three seasonal Sentinel-1 OPERA RTC VV/VH means and valid-pass counts for
-  one bounding box and year. Mask and reproject native bursts, composite
-  with equal-pass weighting, then apply NumPy Refined Lee to seasonal means.
-  Writes a 12-band COG with -9999 nodata,
-  processing manifest, and optionally a STAC item and DPS STAC catalog.
+  Three seasonal Sentinel-1 OPERA RTC VV/VH means for one bounding box and year.
+  Mask and reproject bursts, composite with equal-pass weighting, then apply
+  NumPy Refined Lee to seasonal means. Optional nearest-year gap filling.
+  Writes six Float32 means in a 6-band COG with -9999 nodata, processing
+  manifest, optional single-band Int64 exact-count/provenance COG, and optional DPS STAC.
 algorithm_version: main
 repository_url: https://github.com/aliz237/s1-composite.git
 build_command: s1-composite/build-env.sh
@@ -54,4 +54,20 @@ inputs:
     - name: bbox_crs
       description: CRS of bbox coordinates; EPSG/PROJ/WKT or @custom_albers.wkt. Matching output CRS preserves bounds and grid origin.
       default: EPSG:4326
+      required: false
+    - name: gap_fill
+      description: true or false; fill missing means from complete same-season donor years; per-pixel provenance is available in the optional metadata companion.
+      default: 'false'
+      required: false
+    - name: max_gap_years
+      description: Maximum donor distance 0-3 in calendar years, both directions; nearest first, more valid passes breaks equal-distance ties.
+      default: '1'
+      required: false
+    - name: as_of
+      description: Exclusive UTC data cutoff as ISO date or timestamp; empty uses job start time. Incomplete donor seasons are skipped.
+      default: ''
+      required: false
+    - name: write_meta
+      description: true or false; write an optional single-band Int64 companion COG with exact counts 0-127 and source-year provenance within +/-3 years.
+      default: 'false'
       required: false

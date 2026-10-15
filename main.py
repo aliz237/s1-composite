@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 import sys
 
-from opera_seasonal_mean import (_output_name, _season_dates, parse_bbox as bbox_coords,
+from opera_seasonal_mean import (_output_name, _season_dates, _resolve_cutoff, ARCHIVE_START, parse_bbox as bbox_coords,
                                  resolve_bbox_crs, resolve_crs, seasonal_composites)
 
 
@@ -50,6 +50,12 @@ def parser():
     p.add_argument("--write-stac", type=parse_bool, default=True,
                    help="true/false; disable to skip all STAC generation and validation")
     p.add_argument("--season-windows", type=parse_windows, default=None)
+    p.add_argument("--gap-fill", type=parse_bool, default=False,
+                   help="Fill missing means from nearest complete same-season donor years; record provenance in the optional metadata companion")
+    p.add_argument("--max-gap-years", type=int, default=1)
+    p.add_argument("--write-meta", type=parse_bool, default=False,
+                   help="Write a single-band Int64 companion with exact counts 0-127 and source provenance")
+    p.add_argument("--as-of", default=None, help="Exclusive UTC data cutoff; ISO date/time, default now")
     p.add_argument("--input-dir", type=Path, default=Path("input"))
     p.add_argument("--template", type=Path, help="Explicit local reference raster; otherwise use the one staged DPS file")
     p.add_argument("--output-dir", type=Path, default=Path("output"))
@@ -83,6 +89,11 @@ def run_job(args, maap=None):
     # Validate identities/windows before authenticating or starting expensive work.
     _output_name(args.year, args.identifier)
     _season_dates(args.year, args.season_windows)
+    cutoff = _resolve_cutoff(args.as_of or None)
+    if not ARCHIVE_START.year <= args.year <= cutoff.year:
+        raise ValueError("Target year must be within the OPERA archive through as_of")
+    if not 0 <= args.max_gap_years <= 3:
+        raise ValueError("max-gap-years must be between 0 and 3 (packed QA range)")
     bbox_crs = resolve_bbox_crs(_job_crs_value(args.bbox_crs))
     bbox_coords(args.bbox, bbox_crs)
     template = staged_template(args)
@@ -104,7 +115,8 @@ def run_job(args, maap=None):
         speckle_filter=args.speckle_filter,
         season_windows=args.season_windows, max_results=args.max_results,
         max_pixels=args.max_pixels, filter_tile_size=args.filter_tile_size,
-        overwrite=False, write_stac=args.write_stac)
+        overwrite=False, write_stac=args.write_stac, gap_fill=args.gap_fill,
+        max_gap_years=args.max_gap_years, as_of=cutoff, write_meta=args.write_meta)
     log.info("Finished: %s", outputs["cog"])
     return outputs
 

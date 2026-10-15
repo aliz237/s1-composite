@@ -30,8 +30,10 @@ def write_stac(cog_path, manifest_path):
     if item_path.exists() or catalog_path.exists():
         raise FileExistsError("STAC outputs already exist; use a fresh DPS job directory")
     windows = meta["seasons"]
-    start = min(_utc(s["start"]) for s in windows.values())
-    end_exclusive = max(_utc(s["end_exclusive"]) for s in windows.values())
+    extent = meta.get("source_temporal_extent")
+    start = _utc(extent["start"]) if extent else min(_utc(s["start"]) for s in windows.values())
+    end_exclusive = (_utc(extent["end_exclusive"]) if extent else
+                     max(_utc(s["end_exclusive"]) for s in windows.values()))
     end = end_exclusive - timedelta(microseconds=1)
     identities = {
         k: meta[k] for k in ("year", "identifier", "bbox", "crs", "transform", "width", "height",
@@ -43,6 +45,12 @@ def write_stac(cog_path, manifest_path):
                "source_ids": sorted(r["id"] for r in s["records"])} for name, s in windows.items()
     }
     identities["bbox_crs"] = meta.get("bbox_crs", "EPSG:4326")
+    identities["gap_fill"] = meta.get("gap_fill", {"enabled": False})
+    identities["metadata_raster"] = meta.get("metadata_raster")
+    identities["donors"] = {name: [{"year": d["year"],
+                                       "source_ids": sorted(r["id"] for r in d["records"])}
+                                      for d in s.get("donors", []) if any(d["selected_pixels"].values())]
+                             for name, s in windows.items()}
     signature = hashlib.sha256(json.dumps(identities, sort_keys=True, separators=(",", ":"),
                                          allow_nan=False).encode()).hexdigest()[:16]
     item_id = f"{cog.stem}-{signature}"
@@ -60,9 +68,11 @@ def write_stac(cog_path, manifest_path):
         "s1-composite:speckle_filter": meta["speckle_filter"],
         "s1-composite:filter_version": meta["speckle_filter_version"],
         "s1-composite:filter_stage": meta["filter_stage"],
+        "s1-composite:gap_fill": meta.get("gap_fill", {"enabled": False}),
         "s1-composite:season_windows": {name: {
             "start": s["start"], "end_exclusive": s["end_exclusive"],
-            "retained_bursts": s["retained_bursts"], "passes": s["passes"]}
+            "retained_bursts": s["retained_bursts"], "passes": s["passes"],
+            "donor_years_used": [d["year"] for d in s.get("donors", []) if any(d["selected_pixels"].values())]}
             for name, s in windows.items()},
     }
     # Read headers/georeferencing only: do not scan the raster for statistics.
@@ -73,26 +83,54 @@ def write_stac(cog_path, manifest_path):
         with_proj=True, with_raster=False, with_eo=False, geom_densify_pts=21)
     raster_bands, common_bands = [], []
     with rasterio.open(cog) as src:
-        if src.count != len(meta["bands"]) or src.count != 12:
-            raise ValueError("Expected twelve raster bands matching the manifest")
+        if src.count != len(meta["bands"]) or src.count not in (6, 12, 30):
+            raise ValueError("Expected 6 raster bands (or legacy 12/30) matching the manifest")
         for b in meta["bands"]:
             index, name = b["index"], b["name"]
             if src.descriptions[index - 1] != name:
                 raise ValueError("Raster descriptions differ from manifest band names")
-            is_count = "count_" in name
-            description = ("Valid satellite-pass count; 0 means no observations inside bbox; -9999 is nodata" if is_count else
-                           "Seasonal equal-pass mean of linear gamma-zero backscatter; -9999 means no observations")
+            units = b["units"]
+            source = b.get("role") == "source_provenance"
+            if units == "calendar_year":
+                unit, description = "year", "Source calendar year of the selected seasonal mean; -9999 means no observations"
+            elif units == "nominal_day_of_year":
+                unit, description = "day", "Nominal DOY: UTC calendar day containing midpoint of the source season window, not a measured acquisition date"
+            elif units == "valid_pass_count":
+                unit = "count"
+                description = ("Valid satellite-pass count in the selected source year" if source else
+                               "Original target-year valid satellite-pass count, unchanged by gap filling")
+                description += "; 0 means no observations inside bbox; -9999 is nodata"
+            else:
+                unit, description = "1", "Seasonal equal-pass mean of linear gamma-zero backscatter; may use the recorded donor year if gap filling is enabled"
             raster_bands.append(RasterBand.create(data_type=DataType.FLOAT32,
                                                   nodata=meta["nodata"],
-                                                  unit="count" if is_count else "1"))
+                                                  unit=unit))
             common_bands.append({"name": name, "description": description})
     asset = item.assets["composite"]
-    asset.title = "Three-season Sentinel-1 VV/VH means and valid-pass counts"
-    asset.description = "Twelve-band COG: frozen, summer, shoulder; VV/VH means followed by their counts within each season."
+    asset.title = "Three-season Sentinel-1 VV/VH means and quality"
+    asset.description = "Six Float32 seasonal VV/VH means; exact counts and source provenance are in the optional Int64 companion."
     asset.extra_fields["bands"] = common_bands
     RasterExtension.ext(asset, add_if_missing=True).bands = raster_bands
     item.add_asset("manifest", pystac.Asset(str(manifest), media_type=pystac.MediaType.JSON,
                                           roles=["metadata"], title="Source acquisitions and processing manifest"))
+    details = meta.get("metadata_raster")
+    if details:
+        meta_cog = cog.parent / details["filename"]
+        with rasterio.open(meta_cog) as src:
+            if (src.count != 1 or list(src.descriptions) != [b["name"] for b in details["bands"]]
+                    or src.crs != rasterio.crs.CRS.from_wkt(meta["crs"])
+                    or list(src.transform)[:6] != meta["transform"]
+                    or (src.width, src.height) != (meta["width"], meta["height"])
+                    or any(t != "int64" for t in src.dtypes) or src.nodata != meta["nodata"]):
+                raise ValueError("Companion metadata raster does not match the manifest/grid")
+        extra = pystac.Asset(str(meta_cog), media_type=pystac.MediaType.COG,
+                            roles=["metadata"], title="Exact counts and packed source provenance")
+        extra.extra_fields["bands"] = [{"name": b["name"], "description": "Packed per-polarization source-year code and exact valid-pass count"}
+                                        for b in details["bands"]]
+        extra.extra_fields["s1-composite:encoding"] = details
+        item.add_asset("metadata", extra)
+        RasterExtension.ext(extra, add_if_missing=True).bands = [
+            RasterBand.create(data_type=DataType.INT64, nodata=meta["nodata"], unit="1") for _ in details["bands"]]
     # DPS supplies username, algorithm/version, job tag, created and dps-metadata.
     # Do not guess the final S3 prefix or fabricate those provenance properties.
     catalog = pystac.Catalog(id="DPS", description="Seasonal Sentinel-1 RTC composite outputs",

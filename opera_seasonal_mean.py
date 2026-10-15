@@ -2,7 +2,7 @@
 
 Native-grid burst masking -> user-selected reprojection -> overlap mean within
 pass -> equal-pass seasonal mean -> optional NumPy Refined Lee on the mean.
-Write all means and counts in SAR_S1_{year}_{identifier}.tif, a 12-band COG.
+Write six Float32 means and an optional single-band Int64 metadata COG.
 Requires maap-py, numpy, rasterio, boto3 and the companion refined_lee.py.
 Season intervals are calendar dates [start, end), within the requested year.
 """
@@ -26,6 +26,7 @@ DEFAULT_WINDOWS = {
     "summer": ("06-15", "09-01"),
     "shoulder": ("09-15", "11-01"),
 }
+ARCHIVE_START = datetime(2016, 4, 14, tzinfo=timezone.utc)
 
 
 def parse_bbox(value, bbox_crs="EPSG:4326"):
@@ -123,13 +124,154 @@ def _season_dates(year, windows=None):
     dates = {}
     for season in SEASONS:
         first, last = windows[season]
-        if not all(isinstance(s, str) and re.fullmatch(r"\d{2}-\d{2}", s) for s in (first, last)):
-            raise ValueError("Season endpoints must be month-day strings, e.g. '06-15'")
-        begin, finish = _utc(f"{year}-{first}"), _utc(f"{year}-{last}")
-        if begin >= finish:
-            raise ValueError("Each season must have start < exclusive end within the same year")
-        dates[season] = (begin, finish)
+        dates[season] = _calendar_window(year, first, last)
     return dates
+
+
+def _calendar_window(year, first, last):
+    if not all(isinstance(s, str) and re.fullmatch(r"\d{2}-\d{2}", s) for s in (first, last)):
+        raise ValueError("Season endpoints must be month-day strings, e.g. '06-15'")
+    begin, finish = _utc(f"{year}-{first}"), _utc(f"{year}-{last}")
+    if begin >= finish:
+        raise ValueError("Each season must have start < exclusive end within the same year")
+    return begin, finish
+
+
+def _resolve_cutoff(as_of=None):
+    now = datetime.now(timezone.utc)
+    cutoff = now if as_of is None else _utc(as_of.isoformat() if isinstance(as_of, datetime) else as_of)
+    if cutoff > now or cutoff <= ARCHIVE_START:
+        raise ValueError("as_of must be after the OPERA archive start and no later than now")
+    return cutoff
+
+
+def _season_availability(year, window, cutoff, *, donor=False):
+    """Only complete, archive-supported seasons are eligible as donors."""
+    info = dict(year=int(year), search_results=0, retained_bursts=0, passes=0, records=[])
+    try:
+        begin, finish = _calendar_window(year, *window)
+    except ValueError:
+        if not donor:
+            raise
+        return dict(info, status="invalid_calendar_window")
+    query_start, query_end = max(begin, ARCHIVE_START), min(finish, cutoff)
+    info.update(start=begin.isoformat(), end_exclusive=finish.isoformat(),
+                nominal_doy=(begin + (finish - begin) / 2).timetuple().tm_yday,
+                complete=begin >= ARCHIVE_START and finish <= cutoff,
+                query_start=query_start.isoformat(), query_end_exclusive=query_end.isoformat())
+    if finish <= ARCHIVE_START:
+        return dict(info, status="before_archive_start")
+    if begin >= cutoff:
+        return dict(info, status="not_started_as_of_cutoff")
+    if donor and not info["complete"]:
+        return dict(info, status="incomplete_donor_season")
+    return dict(info, status="ready")
+
+
+SOURCE_OFFSETS = (0, -1, 1, -2, 2, -3, 3)
+META_MAX_COUNT = 127
+
+
+def _pack_quality(source_year, counts, year):
+    """Pack one season into two 10-bit fields, using integer operations only."""
+    if np.any((counts < 0) | (counts > META_MAX_COUNT)):
+        raise ValueError("Metadata count exceeds 127; exact counts cannot be packed without loss")
+    codes = np.full(source_year.shape, 7, dtype="int64")
+    for code, offset in enumerate(SOURCE_OFFSETS):
+        codes[(source_year == year + offset) & (counts > 0)] = code
+    if np.any((counts > 0) & (codes == 7)):
+        raise ValueError("Metadata source year exceeds the supported +/-3-year range")
+    packed = np.zeros(counts.shape[1:], dtype="int64")
+    for p in range(2):
+        packed |= (codes[p] | (counts[p].astype("int64") << 3)) << (10 * p)
+    return packed
+
+
+def _packed_values(values):
+    values = np.asanyarray(values)
+    # Never accept float arrays: Int64 QA may already have lost low bits above
+    # 2**53, and casting back cannot recover or reliably detect that loss.
+    if not np.issubdtype(values.dtype, np.integer):
+        raise ValueError("Packed metadata must be read as Int64, never Float32/Float64")
+    present = ~np.ma.getmaskarray(values) & (np.ma.getdata(values) != int(NODATA))
+    values = np.ma.getdata(values)
+    if np.any(present & ((values < 0) | (values > 2**60 - 1))):
+        raise ValueError("Invalid packed metadata value")
+    return np.where(present, values, 0).astype("int64"), present
+
+
+def _decode_field(codes, present, year, window):
+    valid = present & (codes != 7)
+    years = np.full(codes.shape, int(NODATA), dtype="int16")
+    doys = np.full_like(years, int(NODATA))
+    for code, offset in enumerate(SOURCE_OFFSETS):
+        use = valid & (codes == code)
+        if np.any(use):
+            begin, end = _calendar_window(year + offset, *window)
+            years[use] = year + offset
+            doys[use] = (begin + (end - begin) / 2).timetuple().tm_yday
+    return dict(source_year=years, source_doy=doys, valid=valid,
+                gap_filled=valid & (years != year))
+
+
+def decode_meta(values, year, season_windows=None):
+    """Decode the single Int64 companion band into six named diagnostic fields.
+
+    Fields (vv_frozen, vh_frozen, vv_summer, vh_summer, vv_shoulder, vh_shoulder)
+    contain source_year, source_doy, source_count, target_count, valid and
+    gap_filled arrays. Supply the product's target year and seasonal windows.
+    Original target counts are zero where filled or unresolved; otherwise they
+    equal selected-source counts. Outside-bbox integer fields are -9999.
+    Read with Rasterio's native Int64 dtype; float conversion loses packed bits.
+    """
+    packed, present = _packed_values(values)
+    windows = DEFAULT_WINDOWS if season_windows is None else season_windows
+    result = {}
+    for s, season in enumerate(SEASONS):
+        for p, pol in enumerate(("vv", "vh")):
+            field = (packed >> (10 * (2 * s + p))) & 1023
+            codes, counts = field & 7, field >> 3
+            if np.any(present & ((codes == 7) != (counts == 0))):
+                raise ValueError("Invalid metadata: source year/count validity differs")
+            decoded = _decode_field(codes, present, year, windows[season])
+            decoded["source_count"] = np.where(present, counts, int(NODATA)).astype("int16")
+            decoded["target_count"] = np.where(present,
+                np.where(decoded["valid"] & ~decoded["gap_filled"], counts, 0), int(NODATA)).astype("int16")
+            result[f"{pol}_{season}"] = decoded
+    return result
+
+
+def _fill_season(mean, nobs, year, nominal_doy, inside, max_gap_years, load):
+    """Select the nearest valid donor per polarization; do not mutate nobs.
+
+    Both directions at the same distance are evaluated. More valid passes wins;
+    an exact count tie keeps the preceding year (visited first). Never overwrite
+    observed target-year values or average different donor years together.
+    """
+    valid = (nobs > 0) & inside[None]
+    source_year = np.where(valid, year, 0).astype("int16")
+    source_doy = np.where(valid, nominal_doy, 0).astype("int16")
+    source_count = nobs.copy()
+    original_gap = ~valid & inside[None]
+    attempts = []
+    for distance in range(1, max_gap_years + 1):
+        if not np.any(original_gap & (source_year == 0)):
+            break
+        for candidate in (year - distance, year + distance):
+            if not ARCHIVE_START.year <= candidate <= 9998:
+                continue
+            donor_mean, donor_count, info = load(candidate, donor=True)
+            if donor_count is not None:
+                eligible = original_gap & ((source_year == 0) | (np.abs(source_year - year) == distance))
+                use = eligible & (donor_count > 0) & np.isfinite(donor_mean) & (donor_mean != NODATA)
+                use &= (source_year == 0) | (donor_count > source_count)
+                mean[use] = donor_mean[use]
+                source_count[use] = donor_count[use]
+                source_year[use] = candidate
+                source_doy[use] = info["nominal_doy"]
+            attempts.append(info)
+            del donor_mean, donor_count
+    return mean, source_year, source_doy, source_count, attempts
 
 
 def _output_name(year, identifier):
@@ -139,8 +281,7 @@ def _output_name(year, identifier):
 
 
 def _band_names(season):
-    return (f"vvmean_{season}", f"vhmean_{season}",
-            f"vvcount_{season}", f"vhcount_{season}")
+    return (f"vvmean_{season}", f"vhmean_{season}")
 
 
 def _utc(value):
@@ -275,21 +416,27 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                         season_windows=None, crs=None, spacing=30,
                         template=None, max_results=20000, max_pixels=25000000,
                         filter_tile_size=512, overwrite=False, write_stac=False,
-                        bbox_crs="EPSG:4326"):
-    """Write three seasonal means/counts to one SAR_S1_year_identifier COG.
+                        bbox_crs="EPSG:4326", gap_fill=False, max_gap_years=1,
+                        as_of=None, write_meta=False):
+    """Write six Float32 seasonal means and optional packed Int64 metadata COG.
 
-    Default windows include Jan 1–Mar 31, Jun 15–Aug 31, Sep 15–Oct 31 of
-    year, including leap-year days. Set season_windows using month-day pairs
-    with EXCLUSIVE ends. resampling: 'nearest', 'bilinear', or 'average'.
-    All 12 bands are Float32; counts are integer-valued, with 0 meaning no
-    valid passes. Means are linear gamma-zero power; missing output means are
-    -9999. Counts are 0 for no observations inside bbox; outside bbox is -9999.
-    bbox accepts xmin,ymin,xmax,ymax as a string (DPS) or coordinate sequence,
-    in bbox_crs (default EPSG:4326). Matching input/output CRS preserves the
-    supplied bounds and origin; extents must span whole pixels at spacing.
-    Optional template uses its full grid with the bbox mask. Run per tile.
-    write_stac=True adds an item and catalog; requires the optional STAC helper
-    and dependencies. Default False writes only the COG and source manifest.
+    Default windows: Jan 1-Mar 31, Jun 15-Aug 31, Sep 15-Oct 31. Custom
+    season_windows use month-day pairs with EXCLUSIVE ends in the same year.
+    Means are linear gamma-zero power; all output nodata is -9999.
+    write_meta=True writes one Int64 band with six 10-bit fields: three source
+    bits (target, -1, +1, -2, +2, -3, +3, missing), seven exact count bits
+    (0-127). Use decode_meta with the recorded target year and seasonal windows
+    to obtain per-polarization source year, nominal DOY, counts and fill flags.
+    Counts above 127 fail explicitly only when write_meta=True.
+    bbox accepts xmin,ymin,xmax,ymax as a DPS string or coordinate sequence,
+    in bbox_crs (default EPSG:4326). Explicit output crs or template required.
+    Matching input/output CRS preserves bounds/origin at whole-pixel extents.
+    resampling: nearest (default), bilinear, average. A template uses its full
+    grid with the bbox mask. Refined Lee is applied once per source-year mean.
+    gap_fill=True searches complete same-season donors within max_gap_years
+    (0-3), preserving observed values. as_of is an exclusive UTC cutoff,
+    default now; incomplete seasons are never donors. write_stac=True adds
+    an optional item/catalog linking the composite, manifest and metadata COG.
     """
     import boto3
     import rasterio
@@ -300,6 +447,14 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
     from rasterio.warp import transform_geom
 
     dates = _season_dates(year, season_windows)
+    windows = DEFAULT_WINDOWS if season_windows is None else season_windows
+    cutoff = _resolve_cutoff(as_of)
+    if not ARCHIVE_START.year <= year <= cutoff.year:
+        raise ValueError("Target year must be within the OPERA archive through as_of")
+    if not isinstance(gap_fill, bool):
+        raise ValueError("gap_fill must be True or False")
+    if isinstance(max_gap_years, bool) or not isinstance(max_gap_years, (int, np.integer)) or not 0 <= max_gap_years <= 3:
+        raise ValueError("max_gap_years must be an integer between 0 and 3 (packed QA range)")
     filename = _output_name(year, identifier)
     bbox_crs = resolve_bbox_crs(bbox_crs)
     bbox = parse_bbox(bbox, bbox_crs)
@@ -313,6 +468,8 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
         raise ValueError("resampling must be 'nearest', 'bilinear' or 'average'")
     if not isinstance(speckle_filter, bool):
         raise ValueError("speckle_filter must be True or False")
+    if not isinstance(write_meta, bool):
+        raise ValueError("write_meta must be True or False")
     if not isinstance(write_stac, bool):
         raise ValueError("write_stac must be True or False")
     if isinstance(filter_tile_size, bool) or not isinstance(filter_tile_size, (int, np.integer)) or filter_tile_size < 1:
@@ -322,8 +479,11 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
     folder = Path(outdir)
     final = folder / filename
     manifest = folder / (final.stem + "_manifest.json")
-    if not overwrite and (final.exists() or manifest.exists()):
-        raise FileExistsError(f"Output exists: {final} or {manifest}; use overwrite=True to replace")
+    meta_final = folder / (final.stem + "_meta.tif")
+    if meta_final.exists() and not write_meta:
+        raise FileExistsError(f"Stale metadata output exists: {meta_final}; use a fresh output directory")
+    if not overwrite and any(path.exists() for path in (final, manifest, meta_final)):
+        raise FileExistsError(f"Output exists for {final}; use overwrite=True to replace")
     if not math.isfinite(spacing) or spacing <= 0:
         raise ValueError("spacing must be finite and positive.")
     geometry = _bbox_geometry(bbox)
@@ -370,67 +530,140 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                     speckle_filter_version=FILTER_VERSION if speckle_filter else None,
                     nodata=NODATA, counts_zero="no_valid_passes_inside_bbox",
                     filter_stage="after_seasonal_compositing" if speckle_filter else "none",
+                    as_of=cutoff.isoformat(), archive_start=ARCHIVE_START.isoformat(),
+                    gap_fill=dict(enabled=gap_fill, max_gap_years=int(max_gap_years),
+                                  selection="nearest_year_then_more_valid_passes_per_polarization",
+                                  exact_tie="preceding_year", donors_require_complete_season=True,
+                                  original_counts="target_year_only",
+                                  nominal_doy="UTC calendar day containing midpoint of source season window"),
+                    metadata_raster=(dict(filename=meta_final.name, dtype="int64", nodata=int(NODATA),
+                        encoding_version=1, bits=60, bits_per_field=10,
+                        source_bits=[0, 2], count_bits=[3, 9], count_max=META_MAX_COUNT,
+                        order=[f"{pol}_{season}" for season in SEASONS for pol in ("vv", "vh")],
+                        source_offsets=list(SOURCE_OFFSETS), missing_source_code=7,
+                        bands=[dict(index=1, name="qa", units="packed_metadata", role="source_provenance")]) if write_meta else None),
                     bands=[], seasons={})
     any_usable = False
+    source_intervals = []
     with tempfile.TemporaryDirectory(prefix=final.stem + "_", dir=folder) as temp:
         temporary, cog = Path(temp) / "stack.tif", Path(temp) / filename
-        with rasterio.open(temporary, "w", driver="GTiff", width=width, height=height,
-                           count=12, dtype="float32", crs=crs, transform=affine,
-                           nodata=NODATA, tiled=True, compress="deflate") as dst:
+        meta_temporary, meta_cog = Path(temp) / "diagnostics.tif", Path(temp) / meta_final.name
+        packed_meta = np.zeros((height, width), dtype="int64") if write_meta else None
+        with ExitStack() as stack:
+            profile = dict(driver="GTiff", width=width, height=height, crs=crs,
+                           transform=affine, nodata=NODATA, tiled=True, compress="deflate")
+            dst = stack.enter_context(rasterio.open(temporary, "w", count=6, dtype="float32", **profile))
+            diagnostics = (stack.enter_context(rasterio.open(meta_temporary, "w", count=1,
+                           dtype="int64", **profile)) if write_meta else None)
+            if diagnostics:
+                diagnostics.update_tags(year=year, identifier=identifier,
+                    encoding=json.dumps(metadata["metadata_raster"]), composite=filename)
             dst.update_tags(year=year, identifier=identifier, resampling=resampling,
                             mask_resampling="nearest", mask="OPERA_mask_equals_0",
                             temporal_weighting="equal_valid_pass", counts_zero="no_valid_passes_inside_bbox",
                             speckle_filter=metadata["speckle_filter"],
-                            filter_stage=metadata["filter_stage"])
+                            filter_stage=metadata["filter_stage"], gap_fill=str(gap_fill).lower(),
+                            original_counts="target_year_only", as_of=cutoff.isoformat())
             for s, season in enumerate(SEASONS):
                 begin, finish = dates[season]
-                results = maap.searchGranule(
-                    cmr_host="cmr.earthdata.nasa.gov", short_name="OPERA_L2_RTC-S1_V1",
-                    temporal=f"{begin.strftime('%Y-%m-%dT%H:%M:%SZ')},{finish.strftime('%Y-%m-%dT%H:%M:%SZ')}",
-                    bounding_box=",".join(map(str, search_bbox)), limit=max_results)
-                if len(results) >= max_results:
-                    raise RuntimeError(f"{season} search reached max_results; increase it or use smaller tiles")
-                groups = _records(results, begin, finish)
-                print(f"{season}: {len(results)} search results; {sum(map(len, groups))} retained bursts; "
-                      f"{len(groups)} satellite passes.", flush=True)
-                mean, nobs = _composite(groups, (height, width), read)
-                any_usable |= bool(np.any(nobs))
-                if np.max(nobs) > 2**24:
-                    raise ValueError("Count exceeds the exact integer range of Float32")
-                if not np.any(nobs):
-                    print(f"{season}: no valid observations; writing -9999 means and zero counts", flush=True)
-                elif speckle_filter:
-                    print(f"{season}: filtering completed VV/VH means", flush=True)
-                    mean = refined_lee(mean, valid_mask=(nobs > 0) & inside[None],
-                                       tile_size=filter_tile_size)
-                labels = _band_names(season)
-                for k, label in enumerate(labels):
-                    b = 4 * s + k + 1
-                    values = (np.where((nobs[k] > 0) & inside, mean[k], NODATA) if k < 2
-                              else np.where(inside, nobs[k - 2], NODATA).astype("float32"))
-                    unit = "linear_gamma0_power" if k < 2 else "valid_pass_count"
+                def load_season(source_year, *, donor=False):
+                    info = _season_availability(source_year, windows[season], cutoff, donor=donor)
+                    if info["status"] != "ready":
+                        print(f"{season} {source_year}: {info['status']}", flush=True)
+                        return None, None, info
+                    first, last = _utc(info["query_start"]), _utc(info["query_end_exclusive"])
+                    results = maap.searchGranule(
+                        cmr_host="cmr.earthdata.nasa.gov", short_name="OPERA_L2_RTC-S1_V1",
+                        temporal=f"{first.strftime('%Y-%m-%dT%H:%M:%SZ')},{last.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+                        bounding_box=",".join(map(str, search_bbox)), limit=max_results)
+                    if len(results) >= max_results:
+                        raise RuntimeError(f"{season} {source_year} search reached max_results; increase it or use smaller tiles")
+                    groups = _records(results, first, last)
+                    info.update(search_results=len(results), retained_bursts=sum(map(len, groups)),
+                                passes=len(groups), records=[r for group in groups for r in group])
+                    print(f"{season} {source_year}: {len(results)} search results; {info['retained_bursts']} retained bursts; "
+                          f"{len(groups)} satellite passes.", flush=True)
+                    values, counts = _composite(groups, (height, width), read)
+                    info["status"] = "processed" if np.any(counts) else "no_usable_pixels"
+                    if speckle_filter and np.any(counts):
+                        print(f"{season} {source_year}: filtering completed VV/VH means", flush=True)
+                        values = refined_lee(values, valid_mask=(counts > 0) & inside[None],
+                                             tile_size=filter_tile_size)
+                    return values, counts, info
+
+                mean, nobs, info = load_season(year)
+                if nobs is None:
+                    mean = np.full((2, height, width), np.nan, dtype="float32")
+                    nobs = np.zeros((2, height, width), dtype="uint32")
+                selected_count = nobs
+                donors = []
+                if gap_fill:
+                    mean, source_year, source_doy, selected_count, donors = _fill_season(
+                        mean, nobs, year, info["nominal_doy"], inside, max_gap_years, load_season)
+                    year_pixels = {pol: {str(int(y)): int(np.count_nonzero(source_year[k] == y))
+                                        for y in np.unique(source_year[k]) if y}
+                                   for k, pol in enumerate(("VV", "VH"))}
+                    used_years = {int(y) for values in year_pixels.values() for y in values}
+                    info["source_year_pixels"] = year_pixels
+                    info["filled_pixels"] = {pol: int(np.count_nonzero((source_year[k] != 0) & (source_year[k] != year)))
+                                             for k, pol in enumerate(("VV", "VH"))}
+                    for donor_info in donors:
+                        donor_info["selected_pixels"] = {pol: year_pixels[pol].get(str(donor_info["year"]), 0)
+                                                         for pol in ("VV", "VH")}
+                    info["donors"] = donors
+                    print(f"{season}: gap-filled pixels {info['filled_pixels']}", flush=True)
+                else:
+                    source_year = np.where((nobs > 0) & inside[None], year, 0).astype("int16")
+                    used_years = {int(year)} if np.any(nobs) else set()
+                for source_info in [info, *donors]:
+                    if source_info["year"] in used_years:
+                        source_intervals.append((source_info["query_start"], source_info["query_end_exclusive"]))
+                any_usable |= bool(np.any(selected_count))
+                info["remaining_gap_pixels"] = {pol: int(np.count_nonzero(inside & (selected_count[k] == 0)))
+                                                 for k, pol in enumerate(("VV", "VH"))}
+                metadata["seasons"][season] = info
+                if write_meta:
+                    packed_meta |= _pack_quality(source_year, selected_count, year) << (20 * s)
+                for k, pol in enumerate(("vv", "vh")):
+                    b, label = 2 * s + k + 1, f"{pol}mean_{season}"
+                    values = np.where((selected_count[k] > 0) & inside, mean[k], NODATA).astype("float32")
                     dst.write(values, b)
                     dst.set_band_description(b, label)
                     dst.update_tags(b, season=season, start=begin.isoformat(),
-                                    end_exclusive=finish.isoformat(), units=unit,
-                                    speckle_filter_applied="true" if speckle_filter and k < 2 else "false")
-                    metadata["bands"].append(dict(index=b, name=label, units=unit))
-                metadata["seasons"][season] = dict(
-                    start=begin.isoformat(), end_exclusive=finish.isoformat(),
-                    search_results=len(results), retained_bursts=sum(map(len, groups)),
-                    passes=len(groups), records=[r for group in groups for r in group])
-                del mean, nobs, groups, results, values
+                                    end_exclusive=finish.isoformat(), units="linear_gamma0_power",
+                                    role="seasonal_mean", speckle_filter_applied=str(speckle_filter).lower())
+                    metadata["bands"].append(dict(index=b, name=label, units="linear_gamma0_power", role="seasonal_mean"))
+                del mean, nobs, selected_count, source_year, values
+            dst.update_tags(season_windows=json.dumps(windows))
+            if diagnostics:
+                diagnostics.write(np.where(inside, packed_meta, int(NODATA)), 1)
+                diagnostics.set_band_description(1, "qa")
+                diagnostics.update_tags(1, role="source_provenance", units="packed_metadata",
+                    speckle_filter_applied="false", encoding=json.dumps(metadata["metadata_raster"]))
+                diagnostics.update_tags(season_windows=json.dumps(windows),
+                    encoding=json.dumps(metadata["metadata_raster"]),
+                    nominal_doy="UTC calendar day containing midpoint of selected source-year season")
         if not any_usable:
             raise RuntimeError("No usable pixels in any season; no final COG written")
-        # Nearest overviews keep count bands integer-valued; base pixels unchanged.
+        metadata["bands"].sort(key=lambda b: b["index"])
+        metadata["source_temporal_extent"] = dict(
+            start=min(a for a, b in source_intervals), end_exclusive=max(b for a, b in source_intervals))
+        # Nearest overviews preserve packed bit fields; base pixels unchanged.
         rio_copy(temporary, cog, driver="COG", compress="DEFLATE", blocksize=512,
                  overview_resampling="nearest")
+        if write_meta:
+            rio_copy(meta_temporary, meta_cog, driver="COG", compress="DEFLATE", blocksize=512,
+                     overview_resampling="nearest")
         draft_manifest = Path(temp) / manifest.name
         draft_manifest.write_text(json.dumps(metadata, indent=2))
+        if write_meta:
+            meta_cog.replace(meta_final)
         cog.replace(final)
         draft_manifest.replace(manifest)
     outputs = dict(cog=str(final), manifest=str(manifest),
                    bands=[b["name"] for b in metadata["bands"]])
+    if write_meta:
+        outputs["meta_cog"] = str(meta_final)
     if write_stac:
         outputs.update(_write_stac_outputs(final, manifest))
     return outputs

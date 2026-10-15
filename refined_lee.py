@@ -229,7 +229,9 @@ def filter_geotiff(source, destination, *, mask_path=None, tile_size=512,
     pass through without filtering. Rasterio is required.
     Optional mask_path is a co-registered OPERA acquisition mask: keep code 0.
     Source nodata/internal masks are always respected. Preserve CRS, transform,
-    band descriptions and source dataset tags. Output -9999 nodata, Float32. Count bands identified by metadata are copied unchanged.
+    band descriptions and source dataset tags. Intensity output is Float32 with
+    -9999 nodata. Metadata-identified counts are copied unchanged; a packed
+    Int64 metadata-only raster is copied without any floating-point conversion.
     The destination must differ from the source and is not overwritten by default.
     """
     import rasterio
@@ -258,6 +260,12 @@ def filter_geotiff(source, destination, *, mask_path=None, tile_size=512,
         temporary = stack.enter_context(tempfile.TemporaryDirectory(
             prefix="refined_lee_", dir=destination.parent))
         gtiff, cog = Path(temporary) / "filtered.tif", Path(temporary) / "filtered_cog.tif"
+        # Never send packed Int64 metadata through floating-point filter I/O.
+        if all(src.tags(b).get("units") == "packed_metadata" for b in range(1, src.count + 1)):
+            rio_copy(source, cog, driver="COG", compress="DEFLATE", blocksize=512,
+                     overview_resampling="nearest")
+            cog.replace(destination)
+            return str(destination)
         profile = dict(driver="GTiff", height=src.height, width=src.width,
                        count=src.count, dtype="float32", crs=src.crs,
                        transform=src.transform, nodata=NODATA, tiled=True,
@@ -273,16 +281,17 @@ def filter_geotiff(source, destination, *, mask_path=None, tile_size=512,
                             noise_estimation="mean_of_five_lowest_3x3_normalized_variances",
                             filter_units="linear_power", filter_invalid_edges="retain_input")
             for b in range(1, src.count + 1):
-                is_count = (src.tags(b).get("units") == "valid_pass_count" or
+                is_metadata = (src.tags(b).get("role") in ("source_provenance", "packed_qa") or
+                            src.tags(b).get("units") in ("valid_pass_count", "calendar_year", "nominal_day_of_year", "packed_qa", "packed_metadata") or
                             "count_" in (src.descriptions[b - 1] or "").lower())
                 dst.update_tags(b, **src.tags(b))
-                dst.update_tags(b, speckle_filter_applied="false" if is_count else "true")
+                dst.update_tags(b, speckle_filter_applied="false" if is_metadata else "true")
                 if src.descriptions[b - 1]:
                     dst.set_band_description(b, src.descriptions[b - 1])
                 for expanded, core, target in _tiles(src.height, src.width, tile_size):
                     win = Window.from_slices(*expanded)
                     image = src.read(b, window=win, masked=True).astype("float64")
-                    if is_count:
+                    if is_metadata:
                         dst.write(image.filled(NODATA).astype("float32")[core], b,
                                   window=Window.from_slices(*target))
                         continue
