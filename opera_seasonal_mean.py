@@ -390,6 +390,57 @@ def _window_groups(groups, bbox):
     return [retained for group in groups if (retained := [r for r in group if intersects(r)])]
 
 
+def _support_mask(needed, inside, halo):
+    """All pixels needed for requested outputs, including filter neighbors."""
+    if halo:
+        from scipy.ndimage import maximum_filter
+        return maximum_filter(needed, size=2 * halo + 1, mode="constant", cval=0) & inside
+    return needed & inside
+
+
+def _bounds_window(bounds, affine, shape, margin=0):
+    """Conservative pixel rectangle, including rotated grids and edge pixels."""
+    height, width = shape
+    if not all(math.isfinite(v) for v in bounds):
+        return slice(0, height), slice(0, width)
+    left, bottom, right, top = bounds
+    pixels = [(~affine) * xy for xy in ((left-margin, bottom-margin),
+              (right+margin, bottom-margin), (right+margin, top+margin), (left-margin, top+margin))]
+    cols, rows = zip(*pixels)
+    # One extra output pixel protects boundary rounding in transformed bounds.
+    row0, row1 = max(0, math.floor(min(rows))-1), min(height, math.ceil(max(rows))+1)
+    col0, col1 = max(0, math.floor(min(cols))-1), min(width, math.ceil(max(cols))+1)
+    return slice(min(height, row0), max(0, row1)), slice(min(width, col0), max(0, col1))
+
+
+def _support_groups(groups, support, crs, affine):
+    """Skip catalog envelopes that miss the actual gap plus filter halo.
+
+    Use padded bounding envelopes, not approximate footprint polygons. Missing,
+    dateline/polar or unprojectable bounds remain eligible for a raster check.
+    """
+    from rasterio.errors import RasterioError
+    from rasterio.warp import transform_bounds
+    cache = {}
+    def intersects(record):
+        bounds = record.get("footprint_bounds")
+        if bounds is None:
+            return True
+        bounds = tuple(bounds)
+        if bounds not in cache:
+            if bounds[2] - bounds[0] > 180 or max(abs(bounds[1]), abs(bounds[3])) > 85:
+                cache[bounds] = True
+            else:
+                try:
+                    projected = transform_bounds("EPSG:4326", crs, *bounds, densify_pts=101)
+                    rows, cols = _bounds_window(projected, affine, support.shape, margin=1000)
+                    cache[bounds] = bool(np.any(support[rows, cols]))
+                except (RasterioError, ValueError, OverflowError):
+                    cache[bounds] = True
+        return cache[bounds]
+    return [retained for group in groups if (retained := [r for r in group if intersects(r)])]
+
+
 def _output_name(year, identifier):
     if not isinstance(identifier, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", identifier):
         raise ValueError("identifier must use letters, numbers, underscores or hyphens")
@@ -448,17 +499,23 @@ def _records(results, start, end):
 
 
 def _composite(groups, shape, reader):
-    """Accumulate one pass at a time; reader returns two bands and a valid mask."""
+    """Accumulate equal-pass means from full or compact burst windows.
+
+    A compact reader returns (bands, clear, (rows, cols)) relative to this grid.
+    Bursts still merge within their original pass before temporal averaging.
+    """
     total = np.zeros((2, *shape), dtype="float64")
     nobs = np.zeros((2, *shape), dtype="uint32")
     for i, group in enumerate(groups, 1):
         pass_sum = np.zeros_like(total)
         pass_count = np.zeros_like(nobs)
         for record in group:
-            bands, clear = reader(record)
+            result = reader(record)
+            bands, clear = result[:2]
+            rows, cols = result[2] if len(result) == 3 else (slice(None), slice(None))
             valid = clear[None, :, :] & np.isfinite(bands)
-            pass_sum += np.where(valid, bands, 0)
-            pass_count += valid
+            pass_sum[:, rows, cols] += np.where(valid, bands, 0)
+            pass_count[:, rows, cols] += valid
         covered = pass_count > 0
         np.divide(pass_sum, pass_count, out=pass_sum, where=covered)
         total += pass_sum
@@ -469,62 +526,113 @@ def _composite(groups, shape, reader):
     return mean, nobs
 
 
-def _read_burst(record, *, crs, affine, width, height, inside, resampling):
-    """Read/mask a native source window, then warp to the target grid.
+def _read_burst(record, *, crs, affine, width, height, inside, resampling, support=None, metrics=None):
+    """Mask native data before warping; optionally read only donor gap support.
 
-    The caller supplies any required Rasterio/AWS environment. Extra source
-    pixels support the interpolation kernels. Bursts are never speckle-filtered.
+    Compact results include their destination slices. Cross-CRS warps retain
+    the original source/destination geometry: padding unread native pixels with
+    nodata preserves GDAL's approximate transform and nearest sample selection.
+    Same-CRS reads can crop both geometries. Bursts are never speckle-filtered.
     """
     import rasterio
     from rasterio.enums import Resampling
     from rasterio.warp import reproject, transform_bounds
     from rasterio.windows import Window, from_bounds
 
-    destination = np.full((2, height, width), np.nan, dtype="float32")
-    clear_target = np.zeros((height, width), dtype=bool)
+    if support is not None and (support.shape != inside.shape or resampling != Resampling.nearest):
+        raise ValueError("Compact reads require nearest resampling and matching support/inside grids")
+    if metrics is not None:
+        metrics.update(source_read_pixels=0, warp_pixels=0)
+    compact_window = None
+    def empty():
+        if support is not None:
+            return np.empty((2, 0, 0), "float32"), np.zeros((0, 0), bool), (slice(0,0), slice(0,0))
+        return np.full((2, height, width), np.nan, "float32"), np.zeros((height, width), bool)
+    def source_window(grid_affine, grid_width, grid_height, src):
+        corners = [grid_affine * xy for xy in ((0,0), (grid_width,0),
+                   (grid_width,grid_height), (0,grid_height))]
+        xs, ys = zip(*corners)
+        bounds = transform_bounds(crs, src.crs, min(xs), min(ys), max(xs), max(ys), densify_pts=41)
+        proposed = from_bounds(*bounds, transform=src.transform)
+        col0 = max(0, math.floor(proposed.col_off) - 3)
+        row0 = max(0, math.floor(proposed.row_off) - 3)
+        col1 = min(src.width, math.ceil(proposed.col_off + proposed.width) + 3)
+        row1 = min(src.height, math.ceil(proposed.row_off + proposed.height) + 3)
+        return Window(col0, row0, max(0, col1-col0), max(0, row1-row0))
     with ExitStack() as stack:
-        sources = [stack.enter_context(rasterio.open(record["assets"][p]))
-                   for p in ("VV", "VH", "mask")]
+        sources = [stack.enter_context(rasterio.open(record["assets"][p])) for p in ("VV", "VH", "mask")]
         vv, vh, mask = sources
-        if any(s.crs != vv.crs or s.transform != vv.transform or s.shape != vv.shape
-               for s in (vh, mask)):
+        if any(s.crs != vv.crs or s.transform != vv.transform or s.shape != vv.shape for s in (vh, mask)):
             raise ValueError(f"Burst bands/mask grids differ: {record['id']}")
         if vv.crs is None or vv.transform.b != 0 or vv.transform.d != 0 or vv.transform.a <= 0 or vv.transform.e >= 0:
             raise ValueError("Expected a north-up georeferenced OPERA source grid")
         if any(v != 1 for s in (vv, vh) for v in s.scales) or any(v != 0 for s in (vv, vh) for v in s.offsets):
             raise ValueError("Expected OPERA linear power without scale/offset encoding")
-        corners = [affine * p for p in ((0, 0), (width, 0), (width, height), (0, height))]
-        xs, ys = zip(*corners)
-        source_bounds = transform_bounds(crs, vv.crs, min(xs), min(ys), max(xs), max(ys), densify_pts=41)
-        proposed = from_bounds(*source_bounds, transform=vv.transform)
-        margin = 3  # Interpolation support only.
-        col0 = max(0, math.floor(proposed.col_off) - margin)
-        row0 = max(0, math.floor(proposed.row_off) - margin)
-        col1 = min(vv.width, math.ceil(proposed.col_off + proposed.width) + margin)
-        row1 = min(vv.height, math.ceil(proposed.row_off + proposed.height) + margin)
-        if col0 >= col1 or row0 >= row1:
-            return destination, clear_target
-        window = Window(col0, row0, col1 - col0, row1 - row0)
-        native_transform = vv.window_transform(window)
-        flags = mask.read(1, window=window, masked=True)
-        clear = ~np.ma.getmaskarray(flags) & (flags.data == 0)
-        bands = np.stack([s.read(1, window=window, masked=True).astype("float32").filled(np.nan)
-                          for s in (vv, vh)])
-        valid = clear[None] & np.isfinite(bands)
-        bands = np.where(valid, bands, np.nan)
-        warp = dict(src_transform=native_transform, src_crs=vv.crs,
-                    dst_transform=affine, dst_crs=crs)
-        # NaN excludes source layover/shadow/nodata BEFORE interpolation.
+        window = source_window(affine, width, height, vv)
+        if not window.width or not window.height:
+            return empty()
+        read_window = window
+        if support is not None:
+            bounds = transform_bounds(vv.crs, crs, *vv.bounds, densify_pts=101)
+            rows, cols = _bounds_window(bounds, affine, inside.shape,
+                                       margin=3 * max(abs(vv.transform.a), abs(vv.transform.e)))
+            overlap = support[rows, cols]
+            occupied_rows = np.flatnonzero(np.any(overlap, axis=1))
+            if not occupied_rows.size:
+                return empty()
+            occupied_cols = np.flatnonzero(np.any(overlap, axis=0))
+            compact_window = (slice(rows.start + int(occupied_rows[0]), rows.start + int(occupied_rows[-1]) + 1),
+                              slice(cols.start + int(occupied_cols[0]), cols.start + int(occupied_cols[-1]) + 1))
+            rows, cols = compact_window
+            compact_affine = affine * rasterio.Affine.translation(cols.start, rows.start)
+            compact_shape = (rows.stop-rows.start, cols.stop-cols.start)
+            proposed = source_window(compact_affine, compact_shape[1], compact_shape[0], vv)
+            if not proposed.width or not proposed.height:
+                return empty()
+            read_window = window.intersection(proposed)
+            if vv.crs == crs:
+                # Linear transform: the compact geometry has identical sample locations.
+                affine = compact_affine
+                inside = inside[rows, cols] & support[rows, cols]
+                height, width = compact_shape
+                window = read_window
+            else:
+                # Preserve warp/chunk geometry across CRSs. Only the data read is cropped.
+                inside = inside & support
+        flags = mask.read(1, window=read_window, masked=True)
+        read_clear = ~np.ma.getmaskarray(flags) & (flags.data == 0)
+        read_bands = np.stack([s.read(1, window=read_window, masked=True).astype("float32").filled(np.nan)
+                               for s in (vv, vh)])
+        valid = read_clear[None] & np.isfinite(read_bands)
+        read_bands = np.where(valid, read_bands, np.nan)
+        if window == read_window:
+            bands, clear = read_bands, read_clear
+        else:
+            # This nodata canvas has exactly the rc.5 source shape and transform.
+            native_shape = int(window.height), int(window.width)
+            bands = np.full((2, *native_shape), np.nan, "float32")
+            clear = np.zeros(native_shape, bool)
+            row0, col0 = int(read_window.row_off-window.row_off), int(read_window.col_off-window.col_off)
+            region = (slice(row0,row0+int(read_window.height)), slice(col0,col0+int(read_window.width)))
+            bands[:,region[0],region[1]] = read_bands
+            clear[region] = read_clear
+        destination = np.full((2, height, width), np.nan, "float32")
+        warp = dict(src_transform=vv.window_transform(window), src_crs=vv.crs, dst_transform=affine, dst_crs=crs)
         for b in range(2):
-            reproject(bands[b], destination[b], **warp, src_nodata=np.nan,
-                      dst_nodata=np.nan, resampling=resampling)
-        # Keep the target's nearest source mask category as an additional guard.
-        warped_mask = np.full((height, width), 255, dtype="uint8")
-        reproject(np.where(clear, 0, 255).astype("uint8"), warped_mask,
-                  **warp, src_nodata=255, dst_nodata=255, resampling=Resampling.nearest)
+            reproject(bands[b], destination[b], **warp, src_nodata=np.nan, dst_nodata=np.nan, resampling=resampling)
+        warped_mask = np.full((height, width), 255, "uint8")
+        reproject(np.where(clear, 0, 255).astype("uint8"), warped_mask, **warp,
+                  src_nodata=255, dst_nodata=255, resampling=Resampling.nearest)
         clear_target = (warped_mask == 0) & inside
         destination[:, ~clear_target] = np.nan
-    return destination, clear_target
+        if metrics is not None:
+            metrics.update(source_read_pixels=3 * int(read_window.height * read_window.width), warp_pixels=height*width)
+        if compact_window is None:
+            return destination, clear_target
+        if vv.crs != crs:
+            rows, cols = compact_window
+            destination, clear_target = destination[:,rows,cols].copy(), clear_target[rows,cols].copy()
+        return destination, clear_target, compact_window
 
 
 def _remote_error_kind(error):
@@ -690,7 +798,7 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
         nonlocal aws, refresh_at
         aws, refresh_at = None, 0
 
-    def read_once(record, grid):
+    def read_once(record, grid, support=None, metrics=None):
         nonlocal aws, refresh_at
         if aws is None or time.monotonic() >= refresh_at:
             credentials = maap.aws.earthdata_s3_credentials(endpoint)
@@ -711,11 +819,14 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                           CPL_VSIL_CURL_NON_CACHED=non_cached):
             grid_affine, grid_inside = (affine, inside) if grid is None else grid
             grid_height, grid_width = grid_inside.shape
+            extra = {"metrics": metrics}
+            if support is not None:
+                extra["support"] = support
             return _read_burst(record, crs=crs, affine=grid_affine, width=grid_width,
-                               height=grid_height, inside=grid_inside, resampling=allowed[resampling])
+                               height=grid_height, inside=grid_inside, resampling=allowed[resampling], **extra)
 
-    def read(record, grid=None):
-        return _retry_remote_read(lambda: read_once(record, grid), record, invalidate_credentials)
+    def read(record, grid=None, support=None, metrics=None):
+        return _retry_remote_read(lambda: read_once(record, grid, support, metrics), record, invalidate_credentials)
 
     folder.mkdir(parents=True, exist_ok=True)
     metadata = dict(year=int(year), identifier=identifier, bbox=list(bbox),
@@ -735,7 +846,10 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                                   compare_donor_counts=False, recheck_residual_patches=True, donors_require_complete_season=True,
                                   eligibility=dict(min_pixels=int(gap_min_pixels), core_size=int(gap_core_size),
                                       connectivity=8, scope="original_and_residual_masks_per_polarization", outside_tile="excluded"),
-                                  spatial_processing="adaptive_gap_windows_nearest",
+                                  spatial_processing="adaptive_gap_windows_with_burst_support_nearest",
+                                  burst_pruning="padded_catalog_envelope_intersects_gap_and_filter_halo",
+                                  burst_cropping="native_raster_bounds_and_gap_support",
+                                  cross_crs_warp="preserve_original_geometry_with_nodata_padding",
                                   other_resampling="full_tile_to_preserve_warp_results",
                                   donor_filter_halo_pixels=HALO if speckle_filter else 0,
                                   original_counts="target_year_only",
@@ -779,6 +893,7 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                         print(f"{season} {source_year}: {info['status']}", flush=True)
                         return None, None, info
                     first, last = _utc(info["query_start"]), _utc(info["query_end_exclusive"])
+                    search_started = time.monotonic()
                     results = maap.searchGranule(
                         cmr_host="cmr.earthdata.nasa.gov", short_name="OPERA_L2_RTC-S1_V1",
                         temporal=f"{first.strftime('%Y-%m-%dT%H:%M:%SZ')},{last.strftime('%Y-%m-%dT%H:%M:%SZ')}",
@@ -786,6 +901,7 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                     if len(results) >= max_results:
                         raise RuntimeError(f"{season} {source_year} search reached max_results; increase it or use smaller tiles")
                     groups = _records(results, first, last)
+                    info["search_seconds"] = time.monotonic() - search_started
                     info.update(search_results=len(results), retained_bursts=sum(map(len, groups)),
                                 passes=len(groups), records=[r for group in groups for r in group])
                     print(f"{season} {source_year}: {len(results)} search results; {info['retained_bursts']} retained bursts; "
@@ -809,7 +925,9 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                     values = np.full((2, height, width), np.nan, dtype="float32") if donor else None
                     counts = np.zeros((2, height, width), dtype="uint32") if donor else None
                     accessed = {}
-                    info["read_burst_windows"] = 0
+                    info.update(read_burst_windows=0, skipped_burst_windows=0, empty_burst_windows=0,
+                                burst_returned_pixels=0, source_read_pixels=0, burst_warp_pixels=0, burst_read_seconds=0.0,
+                                composite_seconds=0.0, filter_seconds=0.0)
                     for j, (rows, cols) in enumerate(processing, 1):
                         patch_inside = inside[rows, cols]
                         patch_affine = affine * rasterio.Affine.translation(cols.start, rows.start)
@@ -826,17 +944,40 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                             patch_groups = _window_groups(groups, patch_bbox)
                             print(f"{season} {source_year}: window {j}/{len(processing)} "
                                   f"{patch_shape[1]}x{patch_shape[0]}; {len(patch_groups)} passes", flush=True)
-                        for group in patch_groups:
-                            info["read_burst_windows"] += len(group)
-                            for record in group:
-                                accessed[record["id"]] = record
-                        patch_values, patch_counts = _composite(patch_groups, patch_shape,
-                            lambda record: read(record, grid=(patch_affine, patch_inside)))
+                        patch_support = None
+                        if needed is not None and resampling == "nearest":
+                            patch_support = _support_mask(needed[rows, cols], patch_inside,
+                                                          HALO if speckle_filter else 0)
+                            before = sum(map(len, patch_groups))
+                            patch_groups = _support_groups(patch_groups, patch_support, crs, patch_affine)
+                            skipped = before - sum(map(len, patch_groups))
+                            info["skipped_burst_windows"] += skipped
+                            print(f"{season} {source_year}: window {j}/{len(processing)} gap support "
+                                  f"retains {sum(map(len, patch_groups))} burst reads; skips {skipped}", flush=True)
+                        def reader(record):
+                            read_started = time.monotonic()
+                            metrics = {}
+                            result = read(record, grid=(patch_affine, patch_inside), support=patch_support, metrics=metrics)
+                            info["burst_read_seconds"] += time.monotonic() - read_started
+                            info["read_burst_windows"] += 1
+                            info["burst_returned_pixels"] += result[0].shape[-2] * result[0].shape[-1]
+                            info["source_read_pixels"] += metrics.get("source_read_pixels", 0)
+                            info["burst_warp_pixels"] += metrics.get("warp_pixels", result[0].shape[-2] * result[0].shape[-1])
+                            info["empty_burst_windows"] += int(result[0].size == 0)
+                            accessed[record["id"]] = record
+                            return result
+                        composite_started = time.monotonic()
+                        previous_read_time = info["burst_read_seconds"]
+                        patch_values, patch_counts = _composite(patch_groups, patch_shape, reader)
+                        info["composite_seconds"] += max(0.0, time.monotonic() - composite_started
+                            - (info["burst_read_seconds"] - previous_read_time))
                         if speckle_filter and np.any(patch_counts):
                             print(f"{season} {source_year}: filtering completed VV/VH means "
                                   f"({patch_shape[1]}x{patch_shape[0]})", flush=True)
+                            filter_started = time.monotonic()
                             patch_values = refined_lee(patch_values,
                                 valid_mask=(patch_counts > 0) & patch_inside[None], tile_size=filter_tile_size)
+                            info["filter_seconds"] += time.monotonic() - filter_started
                         # Copy only requested donor pixels, never the padded neighborhood
                         # or target-year observations. Overlapping halos are harmless.
                         if needed is None:
@@ -849,6 +990,18 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                     info["read_bursts"] = len(accessed)
                     info["records"] = sorted(accessed.values(), key=lambda rec: rec["id"])
                     info["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                    stages = ("search_seconds", "burst_read_seconds", "composite_seconds", "filter_seconds")
+                    info["other_seconds"] = max(0.0, info["elapsed_seconds"] - sum(info[k] for k in stages))
+                    for key in (*stages, "other_seconds"):
+                        info[key] = round(info[key], 3)
+                    print(f"{season} {source_year}: timings search={info['search_seconds']:.1f}s, "
+                          f"read/warp/retry={info['burst_read_seconds']:.1f}s, "
+                          f"accumulate={info['composite_seconds']:.1f}s, filter={info['filter_seconds']:.1f}s, "
+                          f"other={info['other_seconds']:.1f}s; "
+                          f"native values read={info['source_read_pixels']}, "
+                          f"burst warp pixels={info['burst_warp_pixels']}, "
+                          f"burst returned pixels={info['burst_returned_pixels']}; "
+                          f"empty burst windows={info['empty_burst_windows']}", flush=True)
                     print(f"{season} {source_year}: completed in {info['elapsed_seconds']:.1f}s; "
                           f"{info['read_burst_windows']} burst windows read", flush=True)
                     return values, counts, info

@@ -62,11 +62,11 @@ pip-installed scientific packages.
 ## Register on MAAP
 
 The registration configuration targets
-[aliz237/s1-composite](https://github.com/aliz237/s1-composite), release tag `v0.1.0-rc.5`:
+[aliz237/s1-composite](https://github.com/aliz237/s1-composite), release tag `v0.1.0-rc.6`:
 
 ```yaml
 repository_url: https://github.com/aliz237/s1-composite.git
-algorithm_version: v0.1.0-rc.5
+algorithm_version: v0.1.0-rc.6
 build_command: s1-composite/build-env.sh
 run_command: s1-composite/run.sh
 ```
@@ -135,7 +135,7 @@ formatted as a CMR string. Do not submit a Python tuple as the DPS parameter.
 job = maap.submitJob(
     identifier="s1-2020-3364",        # DPS job tag
     algo_id="s1-seasonal-rtc",
-    version="v0.1.0-rc.5",
+    version="v0.1.0-rc.6",
     queue="maap-dps-worker-16gb",
     bbox="1358522,3123304,1448522,3213304",
     bbox_crs="@custom_albers.wkt",   # Bounds are in Albers metres.
@@ -322,24 +322,50 @@ the full tile. Following and farther years process only still-unresolved gaps
 that continue to qualify under the patch policy.
 
 Catalog searches still discover the same seasonal acquisitions for the tile.
-Conservative catalog footprint bounds prune bursts far from each donor window;
-missing/ambiguous footprints are retained. Pixel validity still comes from the
-OPERA raster masks. Only requested donor pixels are copied back; filtering halos
-never overwrite target observations. Nearest-resampled windowed filtering agrees
-with full-tile filtering within
-Float32 numerical tolerance. `bilinear` and `average` retain full-tile donor
-processing: GDAL's resampling scales can depend on warp-window geometry, so
-cropping those reads can change values. This preserves their existing behavior;
-the sparse-read speedup currently applies to nearest (the default). See the
+**rc.6 prunes each nearest-resampled donor burst against the actual gap plus
+its filter halo**, rather than just the processing rectangle. It uses conservative
+catalog bounding envelopes padded by 1 km and an output pixel. Missing, polar,
+dateline or unprojectable catalog bounds are retained for a native raster check.
+Native raster bounds then tighten each surviving burst's data read to its overlap
+with the support mask. Bursts with no overlap open headers without reading pixel
+arrays. Catalog bounds only prune; OPERA raster masks still determine validity.
+
+Equal-pass weighting and merging of overlapping bursts are preserved, including
+bursts that supply only filter neighbors. Only requested donor pixels are copied
+back; filtering halos never overwrite target observations. Counts and packed QA
+are exact; filtered means are compared within Float32 numerical tolerance.
+
+When source and output CRSs match, each donor's warp grid can also be cropped.
+Across CRSs, rc.6 keeps the original source/destination warp geometry and pads
+unread native pixels with nodata. This preserves GDAL's nearest sample selection:
+cropping the warp itself can change its approximate coordinate transform. The
+returned burst array is compact, but a cross-CRS warp still processes the original
+patch dimensions. Savings in data reads do not imply the same savings in warp time.
+`bilinear` and `average` retain their full-tile donor path. See the
 [GDAL warping FAQ](https://gdal.org/en/stable/programs/gdalwarp.html#frequently-asked-questions). Runtime still depends on actual
 gap coverage, source I/O and the number of donor years. SciPy supplies compiled
 component labeling and neighborhood filtering, installed through conda-forge
 with `scipy>=1.11,<1.16`. The APIs used do not require SciPy 1.15.3; the range
 allows available builds compatible with the pinned Python 3.11 and NumPy 1.24.4.
 
-Logs and donor manifest entries record gap-pixel counts, window dimensions,
-processed pixels including halos, burst-window reads, and elapsed seconds. For
-a mostly empty tile, substantial donor processing is expected; isolated missing
+Logs and each processed source-season manifest entry record gap-pixel counts,
+window dimensions, processed pixels including halos, burst reads and elapsed time.
+rc.6 also records:
+
+- `search_seconds`, `burst_read_seconds`, `composite_seconds`, `filter_seconds`,
+  and `other_seconds`. Burst reading includes opening datasets, reprojection,
+  credential refresh and retries; accumulation excludes that time.
+- `skipped_burst_windows`: additional catalog-envelope exclusions against actual
+  support, after the existing processing-window pruning. `empty_burst_windows`
+  counts surviving bursts whose native raster bounds miss the support.
+- `source_read_pixels`: requested native values across VV, VH and mask for
+  successful reads. This is not compressed bytes transferred; GDAL may fetch
+  whole blocks and retry requests.
+- `burst_warp_pixels` and `burst_returned_pixels`: spatial grid cells summed over
+  burst reads. These differ when cross-CRS warps preserve the full patch geometry
+  but return a compact overlap to the pass accumulator.
+
+For a mostly empty tile, substantial donor processing is expected; isolated missing
 pixels below the eligibility thresholds trigger no donor work at all. Eligible
 patches use windowed donor reads with nearest resampling.
 

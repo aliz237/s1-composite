@@ -5,7 +5,7 @@ algorithm_description: >-
   NumPy Refined Lee to seasonal means. Optional nearest-year filling of substantial connected missing patches.
   Writes six Float32 means in a 6-band COG with -9999 nodata, processing
   manifest, optional single-band Int64 exact-count/provenance COG, and optional DPS STAC.
-algorithm_version: v0.1.0-rc.5
+algorithm_version: v0.1.0-rc.6
 repository_url: https://github.com/aliz237/s1-composite.git
 build_command: s1-composite/build-env.sh
 run_command: s1-composite/run.sh

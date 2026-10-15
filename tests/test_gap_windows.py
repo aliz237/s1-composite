@@ -96,14 +96,15 @@ class GapWindowsTests(unittest.TestCase):
                     def reader(rec, **kw):
                         acquired=int(rec['acquired'][:4])
                         calls.append((acquired,kw['height'],kw['width']))
-                        values,clear=native_read(dict(rec,assets=assets),**kw)
+                        result=native_read(dict(rec,assets=assets),**kw)
+                        values,clear=result[:2]
                         if acquired==2020 and rec['acquired'][5:7]=='01':
                             col,row=(~transform)*(kw['affine'].c,kw['affine'].f)
                             row,col=int(round(row)),int(round(col))
                             clear &= ~gaps[row:row+kw['height'],col:col+kw['width']]
                             values[:,~clear]=np.nan
                         values *= (acquired-2010)/10
-                        return values,clear
+                        return (values,clear,*result[2:])
                     common=dict(bbox=','.join(map(str,array_bounds(*shape,transform))),year=2020,
                                 identifier=kind+'_'+mode,crs='EPSG:32606',bbox_crs='EPSG:32606',gap_fill=True,
                                 write_meta=True,as_of='2026-01-01',resampling=mode, gap_min_pixels=1, gap_core_size=1)
