@@ -211,8 +211,11 @@ class GapFillTests(unittest.TestCase):
                 clear[:, 1:3] = True
             elif year == 2021:
                 clear[:, 2:4] = True
+            col, row = (~from_origin(400000, 7200000, 30, 30)) * (kwargs["affine"].c, kwargs["affine"].f)
+            row, col = int(round(row)), int(round(col))
+            clear = clear[row:row+kwargs["height"], col:col+kwargs["width"]]
             clear &= kwargs["inside"]
-            values = np.full((2, *shape), year - 2000, dtype="float32")
+            values = np.full((2, *clear.shape), year - 2000, dtype="float32")
             values[:, ~clear] = np.nan
             return values, clear
         with patch.object(m, "_read_burst", side_effect=reader), contextlib.redirect_stdout(io.StringIO()):

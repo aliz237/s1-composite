@@ -18,7 +18,7 @@ import time
 from contextlib import ExitStack
 
 import numpy as np
-from refined_lee import NODATA, __version__ as FILTER_VERSION, refined_lee
+from refined_lee import HALO, NODATA, __version__ as FILTER_VERSION, refined_lee
 
 SEASONS = ("frozen", "summer", "shoulder")
 DEFAULT_WINDOWS = {
@@ -260,9 +260,9 @@ def _fill_season(mean, nobs, year, nominal_doy, inside, max_gap_years, load):
         for candidate in (year - distance, year + distance):
             if not ARCHIVE_START.year <= candidate <= 9998:
                 continue
-            donor_mean, donor_count, info = load(candidate, donor=True)
+            eligible = original_gap & ((source_year == 0) | (np.abs(source_year - year) == distance))
+            donor_mean, donor_count, info = load(candidate, donor=True, needed=np.any(eligible, axis=0))
             if donor_count is not None:
-                eligible = original_gap & ((source_year == 0) | (np.abs(source_year - year) == distance))
                 use = eligible & (donor_count > 0) & np.isfinite(donor_mean) & (donor_mean != NODATA)
                 use &= (source_year == 0) | (donor_count > source_count)
                 mean[use] = donor_mean[use]
@@ -272,6 +272,67 @@ def _fill_season(mean, nobs, year, nominal_doy, inside, max_gap_years, load):
             attempts.append(info)
             del donor_mean, donor_count
     return mean, source_year, source_doy, source_count, attempts
+
+
+def _gap_windows(needed, halo=HALO):
+    """Partition sparse gaps; keep dense gaps together. Return padded slices.
+
+    Split the longest dimension until each tight bounding rectangle is small
+    (<=256x256 pixels in area) or at least 25% of its pixels need filling.
+    Dense/fully missing tiles use one large window rather than many requests.
+    The halo preserves the full 7x7 Refined Lee neighborhood at requested pixels.
+    """
+    height, width = needed.shape
+    pending = [(0, height, 0, width)]
+    windows = []
+    while pending:
+        top, bottom, left, right = pending.pop()
+        mask = needed[top:bottom, left:right]
+        rows = np.flatnonzero(np.any(mask, axis=1))
+        if not rows.size:
+            continue
+        cols = np.flatnonzero(np.any(mask, axis=0))
+        top, bottom = top + int(rows[0]), top + int(rows[-1]) + 1
+        left, right = left + int(cols[0]), left + int(cols[-1]) + 1
+        h, w = bottom - top, right - left
+        area = h * w
+        if area <= 256**2 or np.count_nonzero(mask) >= area / 4:
+            windows.append((slice(max(0, top - halo), min(height, bottom + halo)),
+                            slice(max(0, left - halo), min(width, right + halo))))
+        elif h >= w:
+            mid = (top + bottom) // 2
+            pending.extend([(top, mid, left, right), (mid, bottom, left, right)])
+        else:
+            mid = (left + right) // 2
+            pending.extend([(top, bottom, left, mid), (top, bottom, mid, right)])
+    return sorted(windows, key=lambda window: (window[0].start, window[1].start))
+
+
+def _footprint_bounds(granule):
+    """Optional conservative CMR bounds; absent/ambiguous footprints are kept."""
+    geometry = granule.get("Spatial", {}).get("HorizontalSpatialDomain", {}).get("Geometry", {})
+    points = [point for polygon in _items(geometry.get("GPolygon", []))
+              for point in _items(polygon.get("Boundary", {}).get("Point", []))]
+    if not points:
+        return None
+    xs = [float(p["PointLongitude"]) for p in points]
+    ys = [float(p["PointLatitude"]) for p in points]
+    if max(xs) - min(xs) > 180 or max(map(abs, ys)) > 85:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _window_groups(groups, bbox):
+    # A generous 1 km margin avoids excluding interpolation/support pixels near
+    # the catalog footprint edge. Keep all records when footprint is unavailable.
+    west, south, east, north = bbox
+    pad_y = 1000 / 110000
+    pad_x = pad_y / max(0.01, math.cos(math.radians(max(abs(south), abs(north)))))
+    def intersects(record):
+        bounds = record.get("footprint_bounds")
+        return bounds is None or not (bounds[2] < west - pad_x or bounds[0] > east + pad_x
+                                     or bounds[3] < south - pad_y or bounds[1] > north + pad_y)
+    return [retained for group in groups if (retained := [r for r in group if intersects(r)])]
 
 
 def _output_name(year, identifier):
@@ -322,7 +383,7 @@ def _records(results, start, end):
         record = dict(id=g["GranuleUR"], acquired=acquired.isoformat(),
                       platform=platform, orbit=orbit, burst=burst, assets=assets,
                       direction=attrs.get("ASCENDING_DESCENDING"),
-                      relative_orbit=attrs.get("PATH_NUMBER"))
+                      relative_orbit=attrs.get("PATH_NUMBER"), footprint_bounds=_footprint_bounds(g))
         if key not in selected or (version, produced) > selected[key][0]:
             selected[key] = ((version, produced), record)
     groups = defaultdict(list)
@@ -505,7 +566,7 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
     endpoint = "https://cumulus.asf.earthdatacloud.nasa.gov/s3credentials"
     aws, refreshed_at = None, 0
 
-    def read(record):
+    def read(record, grid=None):
         nonlocal aws, refreshed_at
         if aws is None or time.monotonic() - refreshed_at > 45 * 60:
             credentials = maap.aws.earthdata_s3_credentials(endpoint)
@@ -516,8 +577,10 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
             refreshed_at = time.monotonic()
         with rasterio.Env(aws, GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
                           GDAL_HTTP_MAX_RETRY="3", GDAL_HTTP_RETRY_DELAY="2"):
-            return _read_burst(record, crs=crs, affine=affine, width=width,
-                               height=height, inside=inside, resampling=allowed[resampling])
+            grid_affine, grid_inside = (affine, inside) if grid is None else grid
+            grid_height, grid_width = grid_inside.shape
+            return _read_burst(record, crs=crs, affine=grid_affine, width=grid_width,
+                               height=grid_height, inside=grid_inside, resampling=allowed[resampling])
 
     folder.mkdir(parents=True, exist_ok=True)
     metadata = dict(year=int(year), identifier=identifier, bbox=list(bbox),
@@ -534,6 +597,9 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                     gap_fill=dict(enabled=gap_fill, max_gap_years=int(max_gap_years),
                                   selection="nearest_year_then_more_valid_passes_per_polarization",
                                   exact_tie="preceding_year", donors_require_complete_season=True,
+                                  spatial_processing="adaptive_gap_windows_nearest",
+                                  other_resampling="full_tile_to_preserve_warp_results",
+                                  donor_filter_halo_pixels=HALO if speckle_filter else 0,
                                   original_counts="target_year_only",
                                   nominal_doy="UTC calendar day containing midpoint of source season window"),
                     metadata_raster=(dict(filename=meta_final.name, dtype="int64", nodata=int(NODATA),
@@ -566,7 +632,8 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                             original_counts="target_year_only", as_of=cutoff.isoformat())
             for s, season in enumerate(SEASONS):
                 begin, finish = dates[season]
-                def load_season(source_year, *, donor=False):
+                def load_season(source_year, *, donor=False, needed=None):
+                    started = time.monotonic()
                     info = _season_availability(source_year, windows[season], cutoff, donor=donor)
                     if info["status"] != "ready":
                         print(f"{season} {source_year}: {info['status']}", flush=True)
@@ -583,12 +650,67 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                                 passes=len(groups), records=[r for group in groups for r in group])
                     print(f"{season} {source_year}: {len(results)} search results; {info['retained_bursts']} retained bursts; "
                           f"{len(groups)} satellite passes.", flush=True)
-                    values, counts = _composite(groups, (height, width), read)
+                    # GDAL's non-nearest kernels can depend on warp-window
+                    # geometry (XSCALE/YSCALE). Preserve their full-tile results.
+                    if needed is None or resampling != "nearest":
+                        processing = [(slice(0, height), slice(0, width))]
+                    else:
+                        processing = _gap_windows(needed, HALO if speckle_filter else 0)
+                    info["processing_strategy"] = ("full_target_tile" if needed is None else
+                        "adaptive_gap_windows" if resampling == "nearest" else "full_tile_resampling_compatibility")
+                    info["processing_windows"] = [[rows.start, rows.stop, cols.start, cols.stop]
+                                                   for rows, cols in processing]
+                    info["processed_grid_pixels"] = sum((r.stop-r.start)*(c.stop-c.start) for r,c in processing)
+                    info["requested_gap_pixels"] = int(np.count_nonzero(needed)) if needed is not None else None
+                    if donor:
+                        print(f"{season} {source_year}: {info['requested_gap_pixels']} gap pixels; "
+                              f"{len(processing)} windows; {info['processed_grid_pixels']} pixels including filter halo "
+                              f"(tile has {height * width})", flush=True)
+                    values = np.full((2, height, width), np.nan, dtype="float32") if donor else None
+                    counts = np.zeros((2, height, width), dtype="uint32") if donor else None
+                    accessed = {}
+                    info["read_burst_windows"] = 0
+                    for j, (rows, cols) in enumerate(processing, 1):
+                        patch_inside = inside[rows, cols]
+                        patch_affine = affine * rasterio.Affine.translation(cols.start, rows.start)
+                        patch_shape = patch_inside.shape
+                        if needed is None:
+                            patch_groups = groups
+                        else:
+                            # Catalog bounds only prune clearly unrelated bursts; actual
+                            # OPERA raster masks still decide valid observations.
+                            corners = [patch_affine * xy for xy in ((0, 0), (patch_shape[1], 0),
+                                       (patch_shape[1], patch_shape[0]), (0, patch_shape[0]))]
+                            xs, ys = zip(*corners)
+                            patch_bbox = _search_bbox(_bbox_geometry((min(xs), min(ys), max(xs), max(ys))), crs)
+                            patch_groups = _window_groups(groups, patch_bbox)
+                            print(f"{season} {source_year}: window {j}/{len(processing)} "
+                                  f"{patch_shape[1]}x{patch_shape[0]}; {len(patch_groups)} passes", flush=True)
+                        for group in patch_groups:
+                            info["read_burst_windows"] += len(group)
+                            for record in group:
+                                accessed[record["id"]] = record
+                        patch_values, patch_counts = _composite(patch_groups, patch_shape,
+                            lambda record: read(record, grid=(patch_affine, patch_inside)))
+                        if speckle_filter and np.any(patch_counts):
+                            print(f"{season} {source_year}: filtering completed VV/VH means "
+                                  f"({patch_shape[1]}x{patch_shape[0]})", flush=True)
+                            patch_values = refined_lee(patch_values,
+                                valid_mask=(patch_counts > 0) & patch_inside[None], tile_size=filter_tile_size)
+                        # Copy only requested donor pixels, never the padded neighborhood
+                        # or target-year observations. Overlapping halos are harmless.
+                        if needed is None:
+                            values, counts = patch_values, patch_counts
+                        else:
+                            use = needed[rows, cols]
+                            values[:, rows, cols][:, use] = patch_values[:, use]
+                            counts[:, rows, cols][:, use] = patch_counts[:, use]
                     info["status"] = "processed" if np.any(counts) else "no_usable_pixels"
-                    if speckle_filter and np.any(counts):
-                        print(f"{season} {source_year}: filtering completed VV/VH means", flush=True)
-                        values = refined_lee(values, valid_mask=(counts > 0) & inside[None],
-                                             tile_size=filter_tile_size)
+                    info["read_bursts"] = len(accessed)
+                    info["records"] = sorted(accessed.values(), key=lambda rec: rec["id"])
+                    info["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                    print(f"{season} {source_year}: completed in {info['elapsed_seconds']:.1f}s; "
+                          f"{info['read_burst_windows']} burst windows read", flush=True)
                     return values, counts, info
 
                 mean, nobs, info = load_season(year)

@@ -62,18 +62,19 @@ pip-installed scientific packages.
 ## Register on MAAP
 
 The registration configuration targets
-[aliz237/s1-composite](https://github.com/aliz237/s1-composite), branch `main`:
+[aliz237/s1-composite](https://github.com/aliz237/s1-composite), release tag `v0.1.0-rc.2`:
 
 ```yaml
 repository_url: https://github.com/aliz237/s1-composite.git
-algorithm_version: main
+algorithm_version: v0.1.0-rc.2
 build_command: s1-composite/build-env.sh
 run_command: s1-composite/run.sh
 ```
 
 DPS reads the remote repository during registration. Register after the reviewed
-files are committed and available on remote `main`. This preparation does not
-submit a registration or job.
+commit and matching Git tag have both been pushed. The registration version
+and `submitJob(version=...)` must match the published tag. This preparation does
+not submit a registration or job.
 
 The container/queue settings are the tutorial's `maap_base:v4.2.0`,
 `maap-dps-worker-16gb`, and `20GB` disk. Select resources available to your
@@ -132,7 +133,7 @@ formatted as a CMR string. Do not submit a Python tuple as the DPS parameter.
 job = maap.submitJob(
     identifier="s1-2020-3364",        # DPS job tag
     algo_id="s1-seasonal-rtc",
-    version="main",
+    version="v0.1.0-rc.2",
     queue="maap-dps-worker-16gb",
     bbox="1358522,3123304,1448522,3213304",
     bbox_crs="@custom_albers.wkt",   # Bounds are in Albers metres.
@@ -144,7 +145,7 @@ job = maap.submitJob(
     speckle_filter="true",
     season_windows="{}",
     write_stac="false",             # Use "true" to emit item + catalog
-    gap_fill="true",                # Fill missing seasonal means; provenance is packed in QA.
+    gap_fill="true",                # Fill missing seasonal means; write_meta retains per-pixel provenance.
     write_meta="false",             # Set true to retain exact per-pixel counts.
     max_gap_years="1",              # Check both adjacent years.
     as_of="2026-10-14",             # Optional: no data on/after this UTC midnight.
@@ -275,9 +276,34 @@ Do not interpret a mixed-year VV/VH ratio as a contemporaneous observation.
 Each target/donor season is composited and optionally Refined-Lee filtered
 independently before selecting filled pixels. The patchwork is not filtered
 again. Donors are searched only while gaps remain, and farther years are skipped
-after coverage is complete. Source reads still process the donor season over
-the tile; runtime increases on tiles requiring fallback. No extra dependency
-is required.
+after coverage is complete. With `resampling="nearest"`, donor raster reads and
+filtering use adaptive windows
+around eligible missing pixels, with a three-pixel border when Refined Lee is
+enabled. Small/scattered gaps use small windows; dense or fully missing areas
+use larger windows rather than many tiny requests. The target year still uses
+the full tile. Both equally distant donor years are evaluated at the same gap
+locations so the count-based tie rule is preserved. Farther years process only
+still-unresolved gaps.
+
+Catalog searches still discover the same seasonal acquisitions for the tile.
+Conservative catalog footprint bounds prune bursts far from each donor window;
+missing/ambiguous footprints are retained. Pixel validity still comes from the
+OPERA raster masks. Only requested donor pixels are copied back; filtering halos
+never overwrite target observations. Nearest-resampled windowed filtering agrees
+with full-tile filtering within
+Float32 numerical tolerance. `bilinear` and `average` retain full-tile donor
+processing: GDAL's resampling scales can depend on warp-window geometry, so
+cropping those reads can change values. This preserves their existing behavior;
+the sparse-read speedup currently applies to nearest (the default). See the
+[GDAL warping FAQ](https://gdal.org/en/stable/programs/gdalwarp.html#frequently-asked-questions). Runtime still depends on actual
+gap coverage, source I/O and the number of donor years. No extra dependency is
+required.
+
+Logs and donor manifest entries record gap-pixel counts, window dimensions,
+processed pixels including halos, burst-window reads, and elapsed seconds. For
+a mostly empty tile, substantial donor processing is expected; isolated missing
+pixels no longer trigger full-tile donor raster reads and filtering with nearest
+resampling.
 
 Nominal DOY is the UTC calendar day containing the midpoint of the source
 season's [start, exclusive end) interval, calculated in the source year (leap
