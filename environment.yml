@@ -20,6 +20,7 @@ dependencies:
   - importlib_resources>=6.4,<7
   - mapboxgl=0.10.2
   - requests>=2.32.3,<3
+  - earthaccess=0.15.1  # NASA CMR discovery and noninteractive ASF credential fallback.
   - pip:
       # Tagged source archive: keeps the legacy SDK interface without requiring git.
       - maap-py @ https://github.com/MAAP-Project/maap-py/archive/refs/tags/v4.2.0.tar.gz

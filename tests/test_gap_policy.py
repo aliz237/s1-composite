@@ -86,7 +86,7 @@ class GapPolicyTests(unittest.TestCase):
         with patch.object(m,'_read_burst',side_effect=read),contextlib.redirect_stdout(io.StringIO()):
             result=m.seasonal_composites(maap,','.join(map(str,array_bounds(*shape,transform))),2020,'policy',
                 outdir=folder,crs='EPSG:32606',bbox_crs='EPSG:32606',gap_fill=True,
-                write_meta=True,as_of='2026-01-01',speckle_filter=False)
+                write_meta=True,as_of='2026-01-01',speckle_filter=False, search=maap.searchGranule)
         return result,maap
 
     def test_413_and_418_pixel_seasons_make_zero_donor_queries(self):

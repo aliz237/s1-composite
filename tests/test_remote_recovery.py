@@ -73,7 +73,7 @@ class RemoteRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp,patch.object(m,'_read_burst',side_effect=RasterioIOError('Error fetching directory link')) as read,patch.object(m.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RasterioIOError,'after 3 attempts'):
                 m.seasonal_composites(maap,'400000,7199520,400480,7200000',2020,'failed',
-                    outdir=tmp,crs='EPSG:32606',bbox_crs='EPSG:32606',as_of='2026-01-01',speckle_filter=False)
+                    outdir=tmp,crs='EPSG:32606',bbox_crs='EPSG:32606',as_of='2026-01-01',speckle_filter=False, search=maap.searchGranule)
             self.assertEqual(read.call_count,3)
             self.assertFalse(list(Path(tmp).glob('*.tif')))
             self.assertFalse(list(Path(tmp).glob('*_manifest.json')))
@@ -98,7 +98,7 @@ class RemoteRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp,patch.object(m,'_read_burst',side_effect=reader),patch.object(m.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
             result=m.seasonal_composites(maap,'400000,7199520,400480,7200000',2020,'recover',
                 outdir=tmp,crs='EPSG:32606',bbox_crs='EPSG:32606',as_of='2026-01-01',
-                speckle_filter=False,write_meta=True)
+                speckle_filter=False,write_meta=True, search=maap.searchGranule)
             self.assertEqual(maap.aws.calls,2)
             self.assertEqual(attempts[0],attempts[1])
             with rasterio.open(result['meta_cog']) as src:

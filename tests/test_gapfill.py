@@ -166,7 +166,7 @@ class GapFillTests(unittest.TestCase):
             maap.searchGranule = search
             result = m.seasonal_composites(maap, "400000,7199520,400480,7200000", 2026, "partial",
                 outdir=tmp, crs="EPSG:32606", bbox_crs="EPSG:32606", gap_fill=True,
-                max_gap_years=0, as_of="2026-10-14", speckle_filter=False)
+                max_gap_years=0, as_of="2026-10-14", speckle_filter=False, search=maap.searchGranule)
             meta = json.loads(Path(result["manifest"]).read_text())
             self.assertFalse(meta["seasons"]["shoulder"]["complete"])
             self.assertEqual(maap.searches[-1]["temporal"].split(",")[1], "2026-10-14T00:00:00Z")
@@ -184,7 +184,7 @@ class GapFillTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(m, "_read_burst", side_effect=reader), contextlib.redirect_stdout(io.StringIO()):
             result = m.seasonal_composites(maap, "400000,7199520,400480,7200000", 2016, "boundary",
                 outdir=tmp, crs="EPSG:32606", bbox_crs="EPSG:32606", gap_fill=True,
-                as_of="2018-01-01", speckle_filter=False, write_meta=True, gap_min_pixels=1, gap_core_size=1)
+                as_of="2018-01-01", speckle_filter=False, write_meta=True, gap_min_pixels=1, gap_core_size=1, search=maap.searchGranule)
             with rasterio.open(result["cog"]) as src:
                 self.assertTrue((src.read(1) == 1).all())
                 self.assertEqual(src.count, 6)
@@ -221,7 +221,7 @@ class GapFillTests(unittest.TestCase):
         with patch.object(m, "_read_burst", side_effect=reader), contextlib.redirect_stdout(io.StringIO()):
             result = m.seasonal_composites(maap, "400000,7199520,400480,7200000", 2020, "test",
                 outdir=folder, crs="EPSG:32606", bbox_crs="EPSG:32606", gap_fill=True,
-                as_of="2026-01-01", gap_min_pixels=1, gap_core_size=1, **options)
+                as_of="2026-01-01", gap_min_pixels=1, gap_core_size=1, **options, search=maap.searchGranule)
         return result, maap
 
     def test_cog_provenance_filter_placement_and_original_counts(self):
@@ -362,7 +362,7 @@ class GapFillTests(unittest.TestCase):
                 with patch.object(m, "_read_burst", side_effect=reader), contextlib.redirect_stdout(io.StringIO()):
                     result = m.seasonal_composites(FakeMAAP(), "400000,7199520,400480,7200000", 2020, "plain",
                         outdir=Path(tmp)/str(flag), crs="EPSG:32606", bbox_crs="EPSG:32606",
-                        as_of="2026-01-01", speckle_filter=False, write_meta=flag)
+                        as_of="2026-01-01", speckle_filter=False, write_meta=flag, search=FakeMAAP().searchGranule)
                 with rasterio.open(result["cog"]) as src:
                     self.assertEqual(src.count, 6)
                     arrays.append(src.read())
@@ -377,7 +377,7 @@ class GapFillTests(unittest.TestCase):
         def composite(groups, shape, reader):
             return np.ones((2, *shape), "float32"), np.full((2, *shape), 128, "uint32")
         with tempfile.TemporaryDirectory() as tmp, patch.object(m, "_composite", side_effect=composite), contextlib.redirect_stdout(io.StringIO()):
-            kwargs = dict(maap=FakeMAAP(), bbox="400000,7199520,400480,7200000", year=2020,
+            kwargs = dict(maap=FakeMAAP(), search=FakeMAAP().searchGranule, bbox="400000,7199520,400480,7200000", year=2020,
                 identifier="overflow", crs="EPSG:32606", bbox_crs="EPSG:32606",
                 as_of="2026-01-01", speckle_filter=False)
             bad = Path(tmp)/"overflow"

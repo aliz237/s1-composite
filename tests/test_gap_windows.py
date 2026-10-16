@@ -108,10 +108,10 @@ class GapWindowsTests(unittest.TestCase):
                                 identifier=kind+'_'+mode,crs='EPSG:32606',bbox_crs='EPSG:32606',gap_fill=True,
                                 write_meta=True,as_of='2026-01-01',resampling=mode, gap_min_pixels=1, gap_core_size=1)
                     with patch.object(m,'_read_burst',side_effect=reader), contextlib.redirect_stdout(io.StringIO()):
-                        sparse=m.seasonal_composites(FakeMAAP(),**common,outdir=folder/(kind+mode+'small'))
+                        sparse=m.seasonal_composites(FakeMAAP(),**common,outdir=folder/(kind+mode+'small'), search=FakeMAAP().searchGranule)
                         sparse_calls=calls.copy();calls.clear()
                         with patch.object(m,'_gap_windows',side_effect=lambda mask,halo:[(slice(0,shape[0]),slice(0,shape[1]))]):
-                            full=m.seasonal_composites(FakeMAAP(),**common,outdir=folder/(kind+mode+'full'))
+                            full=m.seasonal_composites(FakeMAAP(),**common,outdir=folder/(kind+mode+'full'), search=FakeMAAP().searchGranule)
                     with rasterio.open(sparse['cog']) as a,rasterio.open(full['cog']) as b:
                         np.testing.assert_allclose(a.read(),b.read(),rtol=3e-6,atol=1e-7)
                     with rasterio.open(sparse['meta_cog']) as a,rasterio.open(full['meta_cog']) as b:

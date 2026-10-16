@@ -16,6 +16,7 @@ output nodata is **-9999**. **CRS is explicit: no default projection.**
 | `run.sh` | Ordered DPS arguments to Python CLI |
 | `main.py` | Noninteractive execution, staged template discovery and logging |
 | `opera_seasonal_mean.py` | Search, masking, reprojection, compositing and final filtering |
+| `earthdata_access.py` | Earthaccess discovery and ASF credential fallback |
 | `refined_lee.py` | NumPy-only intensity filter; count bands remain unchanged |
 | `stac_output.py` | Optional item/catalog generation and validation |
 | `custom_albers.wkt` | Exact nonstandard CRS extracted from the supplied `VV_VH_mean.tif` |
@@ -43,11 +44,40 @@ working directory if present, otherwise in the package directory. An absolute
 one quoted argument. With no CRS, a staged template is required; there is no
 fallback to UTM or any other projection.
 
-MAAP supplies authentication. The job refreshes temporary ASF Earthdata S3
-credentials while reading raster windows directly from OPERA COGs in us-west-2.
-The environment pins MAAP SDK v4.2.0, which supports this compositor's
-`searchGranule` and the supplied registration/submission interface. The newer
-5.x SDK changes those interfaces.
+Discovery uses **`earthaccess.search_data()`**, which searches NASA CMR
+without the MAAP catalog proxy. Earthaccess handles pagination and returns
+UMM-G metadata; a small adapter preserves the compositor's existing burst
+selection, orbit grouping and footprint pruning. Public discovery needs no
+Earthdata login. An Earthaccess hit-count query checks completeness. Searches
+reaching `max_results`, returning duplicate granule IDs or disagreeing with
+the reported hit count fail explicitly instead of producing a truncated composite.
+
+A transient connection/read failure or HTTP 408/429/500/502/503/504 raised by
+Earthaccess retries the complete query, up to four attempts, with backoff and
+jitter. HTTP `Retry-After` is honored; a requested wait longer than 300 seconds
+fails explicitly for a later job retry. Permanent errors fail immediately.
+Request timeouts and page transport use Earthaccess's defaults; the pinned
+version does not expose a per-request timeout through `search_data`.
+There is no custom HTTP search client, XML parser or pagination implementation.
+
+Raster windows still stream directly from OPERA COGs in us-west-2, using
+temporary ASF S3 credentials. MAAP supplies these credentials first. If that
+request fails or returns unusable credentials, **earthaccess** tries a
+noninteractive Earthdata login from the environment, then netrc, then the MAAP
+secrets `EARTHDATA_USERNAME` and `EARTHDATA_PASSWORD` (the same names used by
+the HLS compositor). The environment can also supply `EARTHDATA_TOKEN`.
+The fallback uses the explicit **ASF OPERA** credentials endpoint, rather than
+HLS's LPCLOUD provider, and subsequent refreshes use Earthdata directly.
+It never prompts or persists passwords; temporary environment values loaded
+from secrets are restored after login. A working MAAP secret service is still
+needed if your Earthdata credentials are stored only there. The initial MAAP
+credential request uses the SDK's network behavior. No credentials are passed
+in job arguments.
+
+The environment pins MAAP SDK v4.2.0 for credentials/secrets and the supplied
+registration/submission interface; discovery no longer calls `searchGranule`.
+Earthaccess 0.15.1 is installed from conda-forge for discovery and the credential
+fallback. The newer 5.x MAAP SDK changes the registration/submission interfaces.
 
 All available runtime dependencies, including Rasterio/GDAL, NumPy, STAC
 libraries and the MAAP SDK's dependencies, are installed from **conda-forge**.
@@ -62,11 +92,11 @@ pip-installed scientific packages.
 ## Register on MAAP
 
 The registration configuration targets
-[aliz237/s1-composite](https://github.com/aliz237/s1-composite), release tag `v0.1.0`:
+[aliz237/s1-composite](https://github.com/aliz237/s1-composite), release tag `v0.1.1-rc.1`:
 
 ```yaml
 repository_url: https://github.com/aliz237/s1-composite.git
-algorithm_version: v0.1.0
+algorithm_version: v0.1.1-rc.1
 build_command: s1-composite/build-env.sh
 run_command: s1-composite/run.sh
 ```
@@ -135,7 +165,7 @@ formatted as a CMR string. Do not submit a Python tuple as the DPS parameter.
 job = maap.submitJob(
     identifier="s1-2020-3364",        # DPS job tag
     algo_id="s1-seasonal-rtc",
-    version="v0.1.0",
+    version="v0.1.1-rc.1",
     queue="maap-dps-worker-16gb",
     bbox="1358522,3123304,1448522,3213304",
     bbox_crs="@custom_albers.wkt",   # Bounds are in Albers metres.

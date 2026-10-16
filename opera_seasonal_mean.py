@@ -3,7 +3,8 @@
 Native-grid burst masking -> user-selected reprojection -> overlap mean within
 pass -> equal-pass seasonal mean -> optional NumPy Refined Lee on the mean.
 Write six Float32 means and an optional single-band Int64 metadata COG.
-Requires maap-py, numpy, rasterio, boto3 and the companion refined_lee.py;
+Requires maap-py, numpy, rasterio, boto3, requests and companion modules;
+earthaccess provides a noninteractive fallback for ASF credentials.
 SciPy supplies compiled component/neighborhood operations for gap eligibility.
 Season intervals are calendar dates [start, end), within the requested year.
 """
@@ -21,6 +22,7 @@ from contextlib import ExitStack
 
 import numpy as np
 from refined_lee import HALO, NODATA, __version__ as FILTER_VERSION, refined_lee
+from earthdata_access import search_granules, ASFCredentials, CMR_URL, SEARCH_ATTEMPTS
 
 SEASONS = ("frozen", "summer", "shoulder")
 DEFAULT_WINDOWS = {
@@ -587,7 +589,8 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                         template=None, max_results=20000, max_pixels=25000000,
                         filter_tile_size=512, overwrite=False, write_stac=False,
                         bbox_crs="EPSG:4326", gap_fill=False, max_gap_years=1,
-                        as_of=None, write_meta=False, gap_min_pixels=1024, gap_core_size=7):
+                        as_of=None, write_meta=False, gap_min_pixels=1024, gap_core_size=7,
+                        search=None):
     """Write six Float32 seasonal means and optional packed Int64 metadata COG.
 
     Default windows: Jan 1-Mar 31, Jun 15-Aug 31, Sep 15-Oct 31. Custom
@@ -613,6 +616,8 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
     as_of is an exclusive UTC cutoff,
     default now; incomplete seasons are never donors. write_stac=True adds
     an optional item/catalog linking the composite, manifest and metadata COG.
+    Public discovery uses NASA CMR directly. search may inject an equivalent
+    callable for offline testing; maap is used only for S3 credentials/secrets.
     """
     import boto3
     import rasterio
@@ -683,7 +688,7 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
     if not np.any(inside):
         raise ValueError("Bounding box does not intersect the template grid.")
 
-    endpoint = "https://cumulus.asf.earthdatacloud.nasa.gov/s3credentials"
+    credentials_provider = ASFCredentials(maap)
     aws, refresh_at = None, 0
 
     def invalidate_credentials():
@@ -693,7 +698,7 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
     def read_once(record, grid):
         nonlocal aws, refresh_at
         if aws is None or time.monotonic() >= refresh_at:
-            credentials = maap.aws.earthdata_s3_credentials(endpoint)
+            credentials = credentials_provider()
             lifetime = _credential_lifetime(credentials)
             aws = AWSSession(boto3.Session(
                 aws_access_key_id=credentials["accessKeyId"],
@@ -742,6 +747,9 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                                   nominal_doy="UTC calendar day containing midpoint of source season window"),
                     remote_read_recovery=dict(burst_attempts=3, http_retries=3, backoff_seconds=[5, 15],
                         jitter_max_seconds=2, expiration_margin_seconds=120, skip_failed_bursts=False),
+                    catalog_search=dict(endpoint=CMR_URL if search is None else "injected_search",
+                        client="earthaccess.search_data" if search is None else "injected_search",
+                        query_attempts=SEARCH_ATTEMPTS, pagination="earthaccess", truncated_results_allowed=False),
                     metadata_raster=(dict(filename=meta_final.name, dtype="int64", nodata=int(NODATA),
                         encoding_version=1, bits=60, bits_per_field=10,
                         source_bits=[0, 2], count_bits=[3, 9], count_max=META_MAX_COUNT,
@@ -756,6 +764,7 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
         meta_temporary, meta_cog = Path(temp) / "diagnostics.tif", Path(temp) / meta_final.name
         packed_meta = np.zeros((height, width), dtype="int64") if write_meta else None
         with ExitStack() as stack:
+            search_fn = search_granules if search is None else search
             profile = dict(driver="GTiff", width=width, height=height, crs=crs,
                            transform=affine, nodata=NODATA, tiled=True, compress="deflate")
             dst = stack.enter_context(rasterio.open(temporary, "w", count=6, dtype="float32", **profile))
@@ -779,8 +788,8 @@ def seasonal_composites(maap, bbox, year, identifier, *, outdir="rtc_seasonal",
                         print(f"{season} {source_year}: {info['status']}", flush=True)
                         return None, None, info
                     first, last = _utc(info["query_start"]), _utc(info["query_end_exclusive"])
-                    results = maap.searchGranule(
-                        cmr_host="cmr.earthdata.nasa.gov", short_name="OPERA_L2_RTC-S1_V1",
+                    results = search_fn(
+                        short_name="OPERA_L2_RTC-S1_V1",
                         temporal=f"{first.strftime('%Y-%m-%dT%H:%M:%SZ')},{last.strftime('%Y-%m-%dT%H:%M:%SZ')}",
                         bounding_box=",".join(map(str, search_bbox)), limit=max_results)
                     if len(results) >= max_results:

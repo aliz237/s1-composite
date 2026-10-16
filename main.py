@@ -89,7 +89,7 @@ def _job_crs_value(value):
     return value
 
 
-def run_job(args, maap=None):
+def run_job(args, maap=None, search=None):
     # Validate identities/windows before authenticating or starting expensive work.
     _output_name(args.year, args.identifier)
     _season_dates(args.year, args.season_windows)
@@ -123,7 +123,7 @@ def run_job(args, maap=None):
         max_pixels=args.max_pixels, filter_tile_size=args.filter_tile_size,
         overwrite=False, write_stac=args.write_stac, gap_fill=args.gap_fill,
         max_gap_years=args.max_gap_years, as_of=cutoff, write_meta=args.write_meta,
-        gap_min_pixels=args.gap_min_pixels, gap_core_size=args.gap_core_size)
+        gap_min_pixels=args.gap_min_pixels, gap_core_size=args.gap_core_size, search=search)
     log.info("Finished: %s", outputs["cog"])
     return outputs
 
